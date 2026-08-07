@@ -27,7 +27,7 @@ $DB = [
     'port' => getenv('DB_PORT') ?: '3306',
     'name' => getenv('DB_NAME') ?: 'wdc353_1',
     'user' => getenv('DB_USER') ?: 'wdc353_1',
-    'pass' => getenv('DB_PASS') ?: 'trueshoe43',
+    'pass' => getenv('DB_PASS') ?: '',
 ];
 
 
@@ -1130,7 +1130,6 @@ function handle_integrity_test(PDO $pdo): void
                 flash(
                     'success',
                     'Test passed: the database rejected an assignment only one hour apart. Temporary test data was removed.'
-                    . $message
                 );
             } else {
                 throw $exception;
@@ -2350,13 +2349,13 @@ function render_emails_page(PDO $pdo): void
     ?>
 <div class="grid grid-2">
 <section class="card">
-    <h2>Generate schedule-email logs</h2>
+    <h2>Generate session notices</h2>
     <form method="post">
         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="generate_emails"><input type="hidden" name="return_page" value="emails">
         <div class="form-grid">
             <div class="field"><label>Start date *</label><input type="date" name="start_date" value="<?= e($start) ?>" required></div>
             <div class="field"><label>End date *</label><input type="date" name="end_date" value="<?= e($end) ?>" required></div>
-            <div class="field full"><label><input style="width:auto;min-height:auto" type="checkbox" name="skip_duplicates" value="1" checked> Skip a row when the same sender, receiver, and subject already exist</label></div>
+            <div class="field full"><label><input style="width:auto;min-height:auto" type="checkbox" name="skip_duplicates" value="1" checked> Skip a row when duplicate email already exist</label></div>
         </div>
         <button style="margin-top:14px" type="submit">Generate and log emails</button>
     </form>

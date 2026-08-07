@@ -1354,9 +1354,11 @@ function payment_status_for_session(PDO $pdo, int $membershipNumber, string $ses
     }
 
     $sessionDate = substr($sessionDateTime, 0, 10);
-    $year = (int)substr($sessionDate, 0, 4);
+    $sessionYear = (int)substr($sessionDate, 0, 4);
     $membershipYear = $sessionYear - 1;
-    $age = age_on_date((string)$dob, $sessionDate);
+    
+    $membershipReferenceDate = $membershipYear . '-12-31';
+    $age = age_on_date((string)$dob, $membershipReferenceDate);
     $required = $age >= 18 ? 200.0 : 100.0;
 
     $paymentStmt = $pdo->prepare(
@@ -1563,6 +1565,331 @@ function workflow_position_options(PDO $pdo): array
 function workflow_family_member_options(PDO $pdo): array
 {
     return reference_options($pdo, 'FamilyMember', 'FamilyMemberID');
+}
+
+function workflow_find_column_case_insensitive(array $columns, array $candidates): ?string
+{
+    foreach ($candidates as $candidate) {
+        foreach ($columns as $column) {
+            if (strcasecmp((string)$column, (string)$candidate) === 0) {
+                return (string)$column;
+            }
+        }
+    }
+
+    return null;
+}
+
+function workflow_hobby_label_column(PDO $pdo, string $table, string $keyColumn): string
+{
+    $columns = table_columns($pdo, $table);
+    $columnNames = array_keys($columns);
+    $candidate = workflow_find_column_case_insensitive(
+        $columnNames,
+        ['HobbyName', 'Name', 'Hobby', 'Title', 'Label', 'Description']
+    );
+    if ($candidate !== null && strcasecmp($candidate, $keyColumn) !== 0) {
+        return $candidate;
+    }
+
+    foreach ($columns as $columnName => $column) {
+        if (strcasecmp((string)$columnName, $keyColumn) === 0) {
+            continue;
+        }
+        if (preg_match('/char|text|enum/i', (string)($column['Type'] ?? ''))) {
+            return (string)$columnName;
+        }
+    }
+
+    return $keyColumn;
+}
+
+function workflow_hobby_schema(PDO $pdo): ?array
+{
+    static $cache = [];
+    $cacheKey = (string)spl_object_id($pdo);
+    if (array_key_exists($cacheKey, $cache)) {
+        return $cache[$cacheKey];
+    }
+
+    $foreignKeyStmt = $pdo->query(
+        "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND REFERENCED_TABLE_NAME IS NOT NULL
+         ORDER BY TABLE_NAME, ORDINAL_POSITION"
+    );
+
+    $foreignKeysByTable = [];
+    foreach ($foreignKeyStmt->fetchAll() as $foreignKey) {
+        $foreignKeysByTable[(string)$foreignKey['TABLE_NAME']][] = $foreignKey;
+    }
+
+    foreach ($foreignKeysByTable as $junctionTable => $foreignKeys) {
+        $memberForeignKey = null;
+        $hobbyForeignKey = null;
+
+        foreach ($foreignKeys as $foreignKey) {
+            if (strcasecmp((string)$foreignKey['REFERENCED_TABLE_NAME'], 'ClubMember') === 0) {
+                $memberForeignKey = $foreignKey;
+                break;
+            }
+        }
+        if ($memberForeignKey === null) {
+            continue;
+        }
+
+        foreach ($foreignKeys as $foreignKey) {
+            if (stripos((string)$foreignKey['REFERENCED_TABLE_NAME'], 'hobby') !== false) {
+                $hobbyForeignKey = $foreignKey;
+                break;
+            }
+        }
+        if ($hobbyForeignKey === null) {
+            continue;
+        }
+
+        $lookupTable = (string)$hobbyForeignKey['REFERENCED_TABLE_NAME'];
+        $lookupKey = (string)$hobbyForeignKey['REFERENCED_COLUMN_NAME'];
+        $cache[$cacheKey] = [
+            'lookup_table' => $lookupTable,
+            'lookup_key' => $lookupKey,
+            'lookup_label' => workflow_hobby_label_column($pdo, $lookupTable, $lookupKey),
+            'junction_table' => (string)$junctionTable,
+            'member_column' => (string)$memberForeignKey['COLUMN_NAME'],
+            'junction_hobby_column' => (string)$hobbyForeignKey['COLUMN_NAME'],
+        ];
+        return $cache[$cacheKey];
+    }
+
+    $tables = database_tables($pdo);
+    $lookupCandidates = [];
+    foreach ($tables as $table) {
+        if (stripos($table, 'hobby') === false) {
+            continue;
+        }
+
+        $columns = column_names($pdo, $table);
+        if (workflow_find_column_case_insensitive($columns, ['MembershipNumber', 'ClubMemberID', 'MemberID']) !== null) {
+            continue;
+        }
+
+        $primaryKey = primary_key_columns($pdo, $table);
+        $lookupKey = $primaryKey[0] ?? workflow_find_column_case_insensitive(
+            $columns,
+            ['HobbyID', 'HobbyId', 'HobbyName', 'Name', 'Hobby']
+        );
+        if ($lookupKey === null) {
+            continue;
+        }
+
+        $priority = strcasecmp($table, 'Hobby') === 0 ? 0 : (strcasecmp($table, 'Hobbies') === 0 ? 1 : 2);
+        $lookupCandidates[] = [
+            'priority' => $priority,
+            'table' => $table,
+            'key' => $lookupKey,
+            'label' => workflow_hobby_label_column($pdo, $table, $lookupKey),
+        ];
+    }
+
+    usort($lookupCandidates, static function (array $left, array $right): int {
+        return $left['priority'] <=> $right['priority'];
+    });
+
+    foreach ($lookupCandidates as $lookup) {
+        foreach ($tables as $junctionTable) {
+            if ($junctionTable === $lookup['table']) {
+                continue;
+            }
+
+            $junctionColumns = column_names($pdo, $junctionTable);
+            $memberColumn = workflow_find_column_case_insensitive(
+                $junctionColumns,
+                ['MembershipNumber', 'ClubMemberID', 'MemberID']
+            );
+            if ($memberColumn === null) {
+                continue;
+            }
+
+            $junctionHobbyColumn = workflow_find_column_case_insensitive(
+                $junctionColumns,
+                [(string)$lookup['key'], 'HobbyID', 'HobbyId', 'HobbyName', 'Hobby']
+            );
+            if ($junctionHobbyColumn === null) {
+                continue;
+            }
+
+            $referencesLookup = false;
+            foreach (foreign_keys($pdo, $junctionTable) as $foreignKey) {
+                if (strcasecmp((string)$foreignKey['table'], (string)$lookup['table']) === 0) {
+                    $referencesLookup = true;
+                    break;
+                }
+            }
+            if (!$referencesLookup && stripos($junctionTable, 'hobby') === false) {
+                continue;
+            }
+
+            $cache[$cacheKey] = [
+                'lookup_table' => (string)$lookup['table'],
+                'lookup_key' => (string)$lookup['key'],
+                'lookup_label' => (string)$lookup['label'],
+                'junction_table' => $junctionTable,
+                'member_column' => $memberColumn,
+                'junction_hobby_column' => $junctionHobbyColumn,
+            ];
+            return $cache[$cacheKey];
+        }
+    }
+
+    $cache[$cacheKey] = null;
+    return null;
+}
+
+function workflow_hobby_options(PDO $pdo): array
+{
+    $schema = workflow_hobby_schema($pdo);
+    if ($schema === null) {
+        return [];
+    }
+
+    $sql = 'SELECT ' . qi($schema['lookup_key']) . ' AS option_value,'
+        . ' ' . qi($schema['lookup_label']) . ' AS option_label'
+        . ' FROM ' . qi($schema['lookup_table'])
+        . ' ORDER BY ' . qi($schema['lookup_label']);
+
+    return $pdo->query($sql)->fetchAll();
+}
+
+function workflow_member_hobby_values(PDO $pdo, int $membershipNumber): array
+{
+    $schema = workflow_hobby_schema($pdo);
+    if ($schema === null) {
+        return [];
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT ' . qi($schema['junction_hobby_column']) . ' AS hobby_value'
+        . ' FROM ' . qi($schema['junction_table'])
+        . ' WHERE ' . qi($schema['member_column']) . ' = :member'
+    );
+    $stmt->execute(['member' => $membershipNumber]);
+
+    return array_map(
+        static fn(array $row): string => (string)$row['hobby_value'],
+        $stmt->fetchAll()
+    );
+}
+
+function workflow_sync_member_hobbies(PDO $pdo, int $membershipNumber, array $submittedValues): void
+{
+    $schema = workflow_hobby_schema($pdo);
+    if ($schema === null) {
+        return;
+    }
+
+    $validValues = [];
+    foreach (workflow_hobby_options($pdo) as $option) {
+        $validValues[(string)$option['option_value']] = true;
+    }
+
+    $selectedValues = [];
+    foreach ($submittedValues as $submittedValue) {
+        $value = trim((string)$submittedValue);
+        if ($value === '') {
+            continue;
+        }
+        if (!isset($validValues[$value])) {
+            throw new InvalidArgumentException('One of the selected hobbies is not registered in the hobby list.');
+        }
+        $selectedValues[$value] = true;
+    }
+
+    $deleteStmt = $pdo->prepare(
+        'DELETE FROM ' . qi($schema['junction_table'])
+        . ' WHERE ' . qi($schema['member_column']) . ' = :member'
+    );
+    $deleteStmt->execute(['member' => $membershipNumber]);
+
+    if ($selectedValues === []) {
+        return;
+    }
+
+    $insertStmt = $pdo->prepare(
+        'INSERT INTO ' . qi($schema['junction_table'])
+        . ' (' . qi($schema['member_column']) . ', ' . qi($schema['junction_hobby_column']) . ')'
+        . ' VALUES (:member, :hobby)'
+    );
+    foreach (array_keys($selectedValues) as $hobbyValue) {
+        $insertStmt->execute([
+            'member' => $membershipNumber,
+            'hobby' => $hobbyValue,
+        ]);
+    }
+}
+
+function workflow_member_hobby_label_map(PDO $pdo): array
+{
+    $schema = workflow_hobby_schema($pdo);
+    if ($schema === null) {
+        return [];
+    }
+
+    $rows = $pdo->query(
+        'SELECT j.' . qi($schema['member_column']) . ' AS MembershipNumber,'
+        . ' GROUP_CONCAT(DISTINCT h.' . qi($schema['lookup_label'])
+        . ' ORDER BY h.' . qi($schema['lookup_label']) . " SEPARATOR ', ') AS Hobbies"
+        . ' FROM ' . qi($schema['junction_table']) . ' j'
+        . ' JOIN ' . qi($schema['lookup_table']) . ' h'
+        . ' ON h.' . qi($schema['lookup_key']) . ' = j.' . qi($schema['junction_hobby_column'])
+        . ' GROUP BY j.' . qi($schema['member_column'])
+    )->fetchAll();
+
+    $map = [];
+    foreach ($rows as $row) {
+        $map[(string)$row['MembershipNumber']] = (string)$row['Hobbies'];
+    }
+    return $map;
+}
+
+function workflow_render_hobby_selector(PDO $pdo, array $selectedValues): void
+{
+    $schema = workflow_hobby_schema($pdo);
+    if ($schema === null) {
+        ?>
+        <h2 style="margin-top:24px">Hobbies</h2>
+        <div class="notice warning">The registered hobby tables could not be detected, so hobby selections are unavailable.</div>
+        <?php
+        return;
+    }
+
+    $options = workflow_hobby_options($pdo);
+    $selected = array_fill_keys(array_map('strval', $selectedValues), true);
+    ?>
+    <h2 style="margin-top:24px">Hobbies</h2>
+    <p class="muted small">Select zero or more hobbies from the registered hobby list.</p>
+    <?php if ($options === []): ?>
+        <div class="empty">The registered hobby list is empty.</div>
+    <?php else: ?>
+        <div class="form-grid">
+            <?php foreach ($options as $option): ?>
+                <?php $value = (string)$option['option_value']; ?>
+                <div class="field">
+                    <label style="font-weight:600">
+                        <input
+                            style="width:auto;min-height:auto;margin-right:7px"
+                            type="checkbox"
+                            name="hobby_values[]"
+                            value="<?= e($value) ?>"
+                            <?= isset($selected[$value]) ? 'checked' : '' ?>
+                        >
+                        <?= e($option['option_label']) ?>
+                    </label>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+    <?php
 }
 
 function workflow_relationship_values(PDO $pdo): array
@@ -2182,6 +2509,7 @@ function handle_club_member_save(PDO $pdo): void
 
     $mode = (string)($_POST['mode'] ?? 'insert');
     $fields = is_array($_POST['field'] ?? null) ? $_POST['field'] : [];
+    $hobbyValues = is_array($_POST['hobby_values'] ?? null) ? $_POST['hobby_values'] : [];
     $dob = workflow_date($fields['DOB'] ?? '', 'Date of birth');
     $currentAge = age_on_date($dob, date('Y-m-d'));
 
@@ -2193,6 +2521,7 @@ function handle_club_member_save(PDO $pdo): void
         $pdo->beginTransaction();
         try {
             workflow_update_row($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber], $fields);
+            workflow_sync_member_hobbies($pdo, $membershipNumber, $hobbyValues);
             if ($currentAge < 18) {
                 $stmt = $pdo->prepare(
                     'SELECT COUNT(*) FROM ' . qi('Guardianship')
@@ -2287,6 +2616,7 @@ function handle_club_member_save(PDO $pdo): void
             ]);
         }
 
+        workflow_sync_member_hobbies($pdo, $membershipNumber, $hobbyValues);
         $pdo->commit();
         flash('success', 'Club member, location, and family relationship were created successfully.');
     } catch (Throwable $exception) {
@@ -2304,6 +2634,7 @@ function handle_club_member_delete(PDO $pdo): void
     $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
     $pdo->beginTransaction();
     try {
+        workflow_sync_member_hobbies($pdo, $membershipNumber, []);
         $stmt = $pdo->prepare('DELETE FROM ' . qi('Guardianship') . ' WHERE MembershipNumber = :member');
         $stmt->execute(['member' => $membershipNumber]);
         $stmt = $pdo->prepare('DELETE FROM ' . qi('ClubMemberLocation') . ' WHERE MembershipNumber = :member');
@@ -2535,6 +2866,9 @@ function handle_create_session_with_formations(PDO $pdo): void
     if ($team1 === $team2) {
         throw new InvalidArgumentException('A session must contain two different teams.');
     }
+
+    workflow_assert_head_coach_for_session($pdo, (int)$coach1, $dateTime);
+    workflow_assert_head_coach_for_session($pdo, (int)$coach2, $dateTime);
 
     $score1 = $score1Raw === '' ? null : filter_var($score1Raw, FILTER_VALIDATE_INT);
     $score2 = $score2Raw === '' ? null : filter_var($score2Raw, FILTER_VALIDATE_INT);
@@ -2785,6 +3119,13 @@ function handle_update_session_with_formations(PDO $pdo): void
 
     $sessionId = workflow_required_int($_POST['session_id'] ?? null, 'Session');
     $input = workflow_session_form_input();
+    foreach ($input['formations'] as $formationInput) {
+        workflow_assert_head_coach_for_session(
+            $pdo,
+            (int)$formationInput['coach_id'],
+            (string)$input['session_datetime']
+        );
+    }
     $bundle = workflow_session_bundle($pdo, $sessionId);
     $currentFormations = $bundle['formations'];
     $mapping = workflow_map_session_formations($currentFormations, $input['formations']);
@@ -4735,10 +5076,13 @@ function render_club_members_page(PDO $pdo): void
         $locations = workflow_location_options($pdo);
         $familyMembers = workflow_family_member_options($pdo);
         $relationships = workflow_relationship_values($pdo);
+        $selectedHobbyValues = $editing
+            ? workflow_member_hobby_values($pdo, $membershipNumber)
+            : [];
         page_heading($editing ? 'Edit Club Member' : 'Create Club Member', $editing ? 'Update the club member’s personal information.' : 'Create the member, initial location, and required family relationship for a minor.', '<a class="button secondary" href="' . e(build_url(['page' => 'club_members'])) . '">Back to club members</a>');
         ?>
 <section class="card"><form method="post"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="club_member_save"><input type="hidden" name="return_page" value="club_members"><input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>"><?php if ($editing): ?><input type="hidden" name="membership_number" value="<?= e($membershipNumber) ?>"><?php endif; ?><h2>Club-member information</h2><div class="form-grid"><?php workflow_render_base_fields($pdo, 'ClubMember', $row, $editing); ?></div>
-<?php if (!$editing): ?><h2 style="margin-top:24px">Initial location</h2><div class="form-grid"><div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Start date *</label><input type="date" name="location_start_date" value="<?= e(date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="location_end_date"></div></div><h2 style="margin-top:24px">Family relationship</h2><p class="muted small">A family member is required when the date of birth makes the new member a minor.</p><div class="form-grid"><div class="field"><label>Family member</label><select name="family_member_id"><option value="">— None for a major member —</option><?php foreach ($familyMembers as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Relationship</label><select name="relationship_type"><option value="">— Select —</option><?php foreach ($relationships as $type): ?><option value="<?= e($type) ?>"><?= e($type) ?></option><?php endforeach; ?></select></div><div class="field"><label>Designation</label><select name="is_primary"><option value="1">Primary</option><option value="0">Secondary</option></select></div><div class="field"><label>Relationship start date</label><input type="date" name="relationship_start_date" value="<?= e(date('Y-m-d')) ?>"></div><div class="field"><label>Relationship end date</label><input type="date" name="relationship_end_date"></div></div><?php endif; ?><div class="toolbar" style="margin-top:18px"><button type="submit"><?= $editing ? 'Save club member' : 'Create club member' ?></button><a class="button secondary" href="<?= e(build_url(['page' => 'club_members'])) ?>">Cancel</a></div></form></section>
+<?php if (!$editing): ?><h2 style="margin-top:24px">Initial location</h2><div class="form-grid"><div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Start date *</label><input type="date" name="location_start_date" value="<?= e(date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="location_end_date"></div></div><h2 style="margin-top:24px">Family relationship</h2><p class="muted small">A family member is required when the date of birth makes the new member a minor.</p><div class="form-grid"><div class="field"><label>Family member</label><select name="family_member_id"><option value="">— None for a major member —</option><?php foreach ($familyMembers as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Relationship</label><select name="relationship_type"><option value="">— Select —</option><?php foreach ($relationships as $type): ?><option value="<?= e($type) ?>"><?= e($type) ?></option><?php endforeach; ?></select></div><div class="field"><label>Designation</label><select name="is_primary"><option value="1">Primary</option><option value="0">Secondary</option></select></div><div class="field"><label>Relationship start date</label><input type="date" name="relationship_start_date" value="<?= e(date('Y-m-d')) ?>"></div><div class="field"><label>Relationship end date</label><input type="date" name="relationship_end_date"></div></div><?php endif; ?><?php workflow_render_hobby_selector($pdo, $selectedHobbyValues); ?><div class="toolbar" style="margin-top:18px"><button type="submit"><?= $editing ? 'Save club member' : 'Create club member' ?></button><a class="button secondary" href="<?= e(build_url(['page' => 'club_members'])) ?>">Cancel</a></div></form></section>
 <?php
         return;
     }
@@ -4759,9 +5103,10 @@ function render_club_members_page(PDO $pdo): void
         . ' LEFT JOIN ' . qi('Location') . ' l ON l.LocationID = cml.LocationID'
         . ' ORDER BY cm.LastName, cm.FirstName, cm.MembershipNumber LIMIT 250'
     )->fetchAll();
-    page_heading('Club Members', 'Create, edit, delete, and display major/minor members with location history and family relationships.', '<a class="button" href="' . e(build_url(['page' => 'club_members', 'mode' => 'add'])) . '">Add Club Member</a>');
+    $hobbyLabels = workflow_member_hobby_label_map($pdo);
+    page_heading('Club Members', 'Create, edit, delete, and display major/minor members with location history, family relationships, and hobbies.', '<a class="button" href="' . e(build_url(['page' => 'club_members', 'mode' => 'add'])) . '">Add Club Member</a>');
     ?>
-<section class="card"><div class="table-wrap"><table><thead><tr><th>Membership</th><th>Name</th><th>Type</th><th>Date of birth</th><th>Gender</th><th>Email</th><th>Current location</th><th>Primary guardian</th><th>Actions</th></tr></thead><tbody><?php foreach ($rows as $row): $age = age_on_date((string)$row['DOB'], date('Y-m-d')); ?><tr><td><?= e($row['MembershipNumber']) ?></td><td><?= e($row['FirstName'] . ' ' . $row['LastName']) ?></td><td><span class="badge <?= $age < 18 ? 'warning' : 'success' ?>"><?= $age < 18 ? 'Minor' : 'Major' ?></span></td><td><?= e($row['DOB']) ?></td><td><?= e($row['Gender']) ?></td><td><?= e($row['Email']) ?></td><td><?= format_cell($row['LocationName']) ?></td><td><?= format_cell($row['PrimaryGuardian']) ?></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'edit', 'id' => $row['MembershipNumber']])) ?>">Edit</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'locations', 'id' => $row['MembershipNumber']])) ?>">Locations</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'guardians', 'id' => $row['MembershipNumber']])) ?>">Family</a><form class="inline" method="post" data-confirm="Delete this club member, location history, and family relationships?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="club_member_delete"><input type="hidden" name="return_page" value="club_members"><input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?></tbody></table></div></section>
+<section class="card"><div class="table-wrap"><table><thead><tr><th>Membership</th><th>Name</th><th>Type</th><th>Date of birth</th><th>Gender</th><th>Email</th><th>Current location</th><th>Primary guardian</th><th>Hobbies</th><th>Actions</th></tr></thead><tbody><?php foreach ($rows as $row): $age = age_on_date((string)$row['DOB'], date('Y-m-d')); ?><tr><td><?= e($row['MembershipNumber']) ?></td><td><?= e($row['FirstName'] . ' ' . $row['LastName']) ?></td><td><span class="badge <?= $age < 18 ? 'warning' : 'success' ?>"><?= $age < 18 ? 'Minor' : 'Major' ?></span></td><td><?= e($row['DOB']) ?></td><td><?= e($row['Gender']) ?></td><td><?= e($row['Email']) ?></td><td><?= format_cell($row['LocationName']) ?></td><td><?= format_cell($row['PrimaryGuardian']) ?></td><td><?= e($hobbyLabels[(string)$row['MembershipNumber']] ?? '—') ?></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'edit', 'id' => $row['MembershipNumber']])) ?>">Edit</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'locations', 'id' => $row['MembershipNumber']])) ?>">Locations</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'guardians', 'id' => $row['MembershipNumber']])) ?>">Family</a><form class="inline" method="post" data-confirm="Delete this club member, location history, family relationships, and hobby selections?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="club_member_delete"><input type="hidden" name="return_page" value="club_members"><input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?></tbody></table></div></section>
 <?php
 }
 
@@ -4791,6 +5136,60 @@ function personnel_options(PDO $pdo): array
         "CONCAT(PersonnelID, ' — ', FirstName, ' ', LastName, ' — ', Email)",
         'LastName, FirstName'
     );
+}
+
+function head_coach_options(PDO $pdo): array
+{
+    foreach (['Personnel', 'WorksAt', 'Position'] as $table) {
+        if (!table_exists($pdo, $table)) {
+            return [];
+        }
+    }
+
+    return $pdo->query(
+        'SELECT p.PersonnelID AS option_value,'
+        . " CONCAT(p.PersonnelID, ' — ', p.FirstName, ' ', p.LastName, ' — ', p.Email) AS option_label"
+        . ' FROM ' . qi('Personnel') . ' p'
+        . ' WHERE EXISTS ('
+        . ' SELECT 1 FROM ' . qi('WorksAt') . ' w'
+        . ' JOIN ' . qi('Position') . ' pos ON pos.PositionID = w.PositionID'
+        . ' WHERE w.PersonnelID = p.PersonnelID'
+        . " AND LOWER(TRIM(pos.PositionName)) = 'head coach'"
+        . ' )'
+        . ' ORDER BY p.LastName, p.FirstName, p.PersonnelID'
+    )->fetchAll();
+}
+
+function workflow_assert_head_coach_for_session(
+    PDO $pdo,
+    int $personnelId,
+    string $sessionDateTime
+): void {
+    foreach (['Personnel', 'WorksAt', 'Position'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $sessionDate = substr($sessionDateTime, 0, 10);
+    $stmt = $pdo->prepare(
+        'SELECT COUNT(*)'
+        . ' FROM ' . qi('WorksAt') . ' w'
+        . ' JOIN ' . qi('Position') . ' pos ON pos.PositionID = w.PositionID'
+        . ' WHERE w.PersonnelID = :personnel'
+        . " AND LOWER(TRIM(pos.PositionName)) = 'head coach'"
+        . ' AND w.StartDate <= :session_start'
+        . ' AND (w.EndDate IS NULL OR w.EndDate >= :session_end)'
+    );
+    $stmt->execute([
+        'personnel' => $personnelId,
+        'session_start' => $sessionDate,
+        'session_end' => $sessionDate,
+    ]);
+
+    if ((int)$stmt->fetchColumn() === 0) {
+        throw new InvalidArgumentException(
+            'The selected personnel member is not assigned as a Head Coach on the session date.'
+        );
+    }
 }
 
 function member_options(PDO $pdo): array
@@ -4838,7 +5237,7 @@ function render_formations_page(PDO $pdo): void
     }
 
     $teams = team_options($pdo);
-    $coaches = personnel_options($pdo);
+    $coaches = head_coach_options($pdo);
     $editSessionId = isset($_GET['edit_session']) ? (int)$_GET['edit_session'] : 0;
     $editing = $editSessionId > 0;
     $sessionValue = [];
@@ -5127,7 +5526,7 @@ function render_reports_page(PDO $pdo, array $savedReports, string $reportSql, a
 {
     page_heading(
         'Reports and Query Results',
-        'Run one read-only query at a time and display its result in the browser. Paste the final Q8–Q19 SQL into the saved-report array near the top of index.php.'
+        ''
     );
     ?>
 <div class="grid grid-2">

@@ -51,25 +51,850 @@ foreach ($configPaths as $configPath) {
 $APP = [
     'title' => 'Country Soccer Club System',
     'rows_per_table' => 200,
-    // The sample project data contains 2026 formations but mostly 2025 payments.
-    // Leave false until the group confirms the exact renewal-date policy.
-    'enforce_payment_eligibility_on_assignment' => false,
+    // For a session in year Y, eligibility is based on full payment of annual membership fee of year Y-1.
+    'enforce_payment_eligibility_on_assignment' => true,
 ];
 
 
 $SAVED_REPORTS = [
-    'Q8'  => ['title' => 'Locations with FIFA-game participants', 'sql' => ''],
-    'Q9'  => ['title' => 'Primary family members with FIFA-game participants', 'sql' => ''],
-    'Q10' => ['title' => 'Team formations for a location and period', 'sql' => ''],
-    'Q11' => ['title' => 'Members who participated in at least five FIFA games', 'sql' => ''],
-    'Q12' => ['title' => 'Formation summary by location and period', 'sql' => ''],
-    'Q13' => ['title' => 'Active members never assigned to a formation', 'sql' => ''],
-    'Q14' => ['title' => 'Major members who joined as minors', 'sql' => ''],
-    'Q15' => ['title' => 'Active members assigned only as Goalkeeper', 'sql' => ''],
-    'Q16' => ['title' => 'Members assigned to all five required roles', 'sql' => ''],
-    'Q17' => ['title' => 'Family members who are head coaches at the same location', 'sql' => ''],
-    'Q18' => ['title' => 'Active members who have never won a formation game', 'sql' => ''],
-    'Q19' => ['title' => 'Volunteer personnel who are family members', 'sql' => ''],
+    'Q8' => [
+        'title' => 'Locations with FIFA-game participants',
+        'sql' => <<<'SQL'
+SELECT
+    l.LocationID,
+    l.Name AS LocationName,
+    l.Address,
+    l.City,
+    l.Province,
+    l.PostalCode,
+    GROUP_CONCAT(
+        DISTINCT lp.PhoneNumber
+        ORDER BY lp.PhoneNumber
+        SEPARATOR ', '
+    ) AS PhoneNumbers,
+    l.WebAddress,
+    l.LocationType,
+    l.MaxCapacity,
+    GROUP_CONCAT(
+        DISTINCT CONCAT_WS(' ', gm.FirstName, gm.LastName)
+        ORDER BY gm.FirstName, gm.LastName
+        SEPARATOR ', '
+    ) AS GeneralManagerName,
+    (
+        SELECT COUNT(*)
+        FROM ClubMemberLocation AS cml_minor
+        JOIN ClubMember AS cm_minor
+            ON cm_minor.MembershipNumber = cml_minor.MembershipNumber
+        WHERE cml_minor.LocationID = l.LocationID
+          AND cml_minor.EndDate IS NULL
+          AND TIMESTAMPDIFF(YEAR, cm_minor.DOB, CURDATE()) < 18
+    ) AS NumberOfMinorMembers,
+    (
+        SELECT COUNT(*)
+        FROM ClubMemberLocation AS cml_major
+        JOIN ClubMember AS cm_major
+            ON cm_major.MembershipNumber = cml_major.MembershipNumber
+        WHERE cml_major.LocationID = l.LocationID
+          AND cml_major.EndDate IS NULL
+          AND TIMESTAMPDIFF(YEAR, cm_major.DOB, CURDATE()) >= 18
+    ) AS NumberOfMajorMembers,
+    COUNT(DISTINCT p.MembershipNumber) AS NumberOfFIFAParticipants
+FROM Location AS l
+JOIN ClubMemberLocation AS cml
+    ON cml.LocationID = l.LocationID
+   AND cml.EndDate IS NULL
+JOIN Participation AS p
+    ON p.MembershipNumber = cml.MembershipNumber
+LEFT JOIN LocationPhone AS lp
+    ON lp.LocationID = l.LocationID
+LEFT JOIN WorksAt AS wa
+    ON wa.LocationID = l.LocationID
+   AND wa.PositionID = 1
+   AND wa.EndDate IS NULL
+LEFT JOIN Personnel AS gm
+    ON gm.PersonnelID = wa.PersonnelID
+GROUP BY
+    l.LocationID,
+    l.Name,
+    l.Address,
+    l.City,
+    l.Province,
+    l.PostalCode,
+    l.WebAddress,
+    l.LocationType,
+    l.MaxCapacity
+HAVING COUNT(DISTINCT p.MembershipNumber) >= 2
+ORDER BY
+    NumberOfFIFAParticipants DESC,
+    l.LocationID ASC
+SQL,
+    ],
+
+    'Q9' => [
+        'title' => 'Primary family members with FIFA-game participants',
+        'sql' => <<<'SQL'
+SELECT DISTINCT
+    fm.FamilyMemberID,
+    fm.FirstName AS FamilyMemberFirstName,
+    fm.LastName AS FamilyMemberLastName,
+    cm.MembershipNumber,
+    cm.FirstName AS ClubMemberFirstName,
+    cm.LastName AS ClubMemberLastName,
+    cm.DOB,
+    g.RelationshipType
+FROM FamilyMember AS fm
+JOIN Guardianship AS g
+    ON g.FamilyMemberID = fm.FamilyMemberID
+   AND g.IsPrimary = 1
+   AND g.EndDate IS NULL
+JOIN ClubMember AS cm
+    ON cm.MembershipNumber = g.MembershipNumber
+WHERE EXISTS (
+    SELECT 1
+    FROM Participation AS p
+    WHERE p.MembershipNumber = cm.MembershipNumber
+)
+AND (
+    SELECT COUNT(DISTINCT g2.MembershipNumber)
+    FROM Guardianship AS g2
+    WHERE g2.FamilyMemberID = fm.FamilyMemberID
+      AND g2.IsPrimary = 1
+      AND g2.EndDate IS NULL
+      AND EXISTS (
+          SELECT 1
+          FROM Participation AS p2
+          WHERE p2.MembershipNumber = g2.MembershipNumber
+      )
+) >= 2
+ORDER BY
+    fm.FirstName ASC,
+    fm.LastName ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q10' => [
+        'title' => 'Team formations for a location and period',
+        'sql' => <<<'SQL'
+/* Assumption: LocationID = 1, from 2026-01-01 through 2026-05-31. */
+SELECT
+    hc.FirstName AS HeadCoachFirstName,
+    hc.LastName AS HeadCoachLastName,
+    s.SessionDateTime AS SessionStartTime,
+    s.Address AS SessionAddress,
+    s.SessionType,
+    t.TeamName,
+    CASE
+        WHEN s.SessionDateTime > NOW() THEN NULL
+        ELSE tf.Score
+    END AS Score,
+    (
+        SELECT COUNT(*)
+        FROM FormationAssignment AS fa_count
+        WHERE fa_count.FormationID = tf.FormationID
+    ) AS TotalNumberOfPlayers,
+    cm.FirstName AS PlayerFirstName,
+    cm.LastName AS PlayerLastName,
+    fa.Role
+FROM TeamFormation AS tf
+JOIN `Session` AS s
+    ON s.SessionID = tf.SessionID
+JOIN Team AS t
+    ON t.TeamID = tf.TeamID
+JOIN Personnel AS hc
+    ON hc.PersonnelID = tf.HeadCoachID
+LEFT JOIN FormationAssignment AS fa
+    ON fa.FormationID = tf.FormationID
+LEFT JOIN ClubMember AS cm
+    ON cm.MembershipNumber = fa.MembershipNumber
+WHERE t.LocationID = 1
+  AND s.SessionDateTime >= '2026-01-01 00:00:00'
+  AND s.SessionDateTime < '2026-06-01 00:00:00'
+ORDER BY
+    s.SessionDateTime ASC,
+    t.TeamName ASC,
+    cm.LastName ASC,
+    cm.FirstName ASC
+SQL,
+    ],
+
+    'Q11' => [
+        'title' => 'Members who participated in at least five FIFA games',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    COUNT(DISTINCT p.GameID) AS TotalFIFAGames,
+    MIN(YEAR(fg.GameDate)) AS MinimumGameYear,
+    MAX(YEAR(fg.GameDate)) AS MaximumGameYear
+FROM ClubMember AS cm
+JOIN Participation AS p
+    ON p.MembershipNumber = cm.MembershipNumber
+JOIN FIFA_Game AS fg
+    ON fg.GameID = p.GameID
+GROUP BY
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName
+HAVING COUNT(DISTINCT p.GameID) >= 5
+ORDER BY
+    TotalFIFAGames DESC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q12' => [
+        'title' => 'Formation summary by location and period',
+        'sql' => <<<'SQL'
+/* Assumption: from 2026-01-01 through 2026-05-31. */
+SELECT
+    l.LocationID,
+    l.Name AS LocationName,
+    COUNT(
+        DISTINCT CASE
+            WHEN s.SessionType = 'Training' THEN s.SessionID
+        END
+    ) AS TotalTrainingSessions,
+    COALESCE(
+        SUM(
+            CASE
+                WHEN s.SessionType = 'Training'
+                 AND fa.MembershipNumber IS NOT NULL
+                THEN 1
+                ELSE 0
+            END
+        ),
+        0
+    ) AS TotalPlayersInTrainingSessions,
+    COUNT(
+        DISTINCT CASE
+            WHEN s.SessionType = 'Game' THEN s.SessionID
+        END
+    ) AS TotalGameSessions,
+    COALESCE(
+        SUM(
+            CASE
+                WHEN s.SessionType = 'Game'
+                 AND fa.MembershipNumber IS NOT NULL
+                THEN 1
+                ELSE 0
+            END
+        ),
+        0
+    ) AS TotalPlayersInGameSessions
+FROM Location AS l
+LEFT JOIN Team AS t
+    ON t.LocationID = l.LocationID
+LEFT JOIN TeamFormation AS tf
+    ON tf.TeamID = t.TeamID
+LEFT JOIN `Session` AS s
+    ON s.SessionID = tf.SessionID
+   AND s.SessionDateTime >= '2026-01-01 00:00:00'
+   AND s.SessionDateTime < '2026-06-01 00:00:00'
+LEFT JOIN FormationAssignment AS fa
+    ON fa.FormationID = tf.FormationID
+GROUP BY
+    l.LocationID,
+    l.Name
+HAVING COUNT(
+    DISTINCT CASE
+        WHEN s.SessionType = 'Game' THEN s.SessionID
+    END
+) >= 4
+ORDER BY
+    TotalGameSessions DESC,
+    l.LocationID ASC
+SQL,
+    ],
+
+    'Q13' => [
+        'title' => 'Active members never assigned to a formation',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) AS Age,
+    cm.Phone,
+    cm.Email,
+    COUNT(DISTINCT p.GameID) AS NumberOfFIFAGames,
+    l.Name AS CurrentLocationName
+FROM ClubMember AS cm
+JOIN ClubMemberLocation AS current_cml
+    ON current_cml.MembershipNumber = cm.MembershipNumber
+   AND current_cml.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = current_cml.LocationID
+JOIN (
+    SELECT
+        MembershipNumber,
+        MIN(StartDate) AS JoinDate
+    FROM ClubMemberLocation
+    GROUP BY MembershipNumber
+) AS membership
+    ON membership.MembershipNumber = cm.MembershipNumber
+JOIN Participation AS p
+    ON p.MembershipNumber = cm.MembershipNumber
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM FormationAssignment AS fa
+    WHERE fa.MembershipNumber = cm.MembershipNumber
+)
+AND (
+    (
+        YEAR(membership.JoinDate) < YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE()) - 1
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(
+                YEAR,
+                cm.DOB,
+                CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+            ) < 18 THEN 100
+            ELSE 200
+        END
+    )
+    OR
+    (
+        YEAR(membership.JoinDate) = YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE())
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+            ELSE 200
+        END
+    )
+)
+GROUP BY
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    cm.DOB,
+    cm.Phone,
+    cm.Email,
+    l.Name
+ORDER BY
+    CurrentLocationName ASC,
+    NumberOfFIFAGames ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q14' => [
+        'title' => 'Major members who joined as minors',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    CASE
+        WHEN (
+            YEAR(membership.JoinDate) < YEAR(CURDATE())
+            AND COALESCE(
+                (
+                    SELECT SUM(pay.Amount)
+                    FROM Payment AS pay
+                    WHERE pay.MembershipNumber = cm.MembershipNumber
+                      AND pay.MembershipYear = YEAR(CURDATE()) - 1
+                ),
+                0
+            ) >= CASE
+                WHEN TIMESTAMPDIFF(
+                    YEAR,
+                    cm.DOB,
+                    CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+                ) < 18 THEN 100
+                ELSE 200
+            END
+        )
+        OR (
+            YEAR(membership.JoinDate) = YEAR(CURDATE())
+            AND COALESCE(
+                (
+                    SELECT SUM(pay.Amount)
+                    FROM Payment AS pay
+                    WHERE pay.MembershipNumber = cm.MembershipNumber
+                      AND pay.MembershipYear = YEAR(CURDATE())
+                ),
+                0
+            ) >= CASE
+                WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+                ELSE 200
+            END
+        )
+        THEN 'Active'
+        ELSE 'Inactive'
+    END AS Status,
+    membership.JoinDate AS DateOfJoining,
+    TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) AS Age,
+    cm.Phone,
+    cm.Email,
+    l.Name AS CurrentLocationName
+FROM ClubMember AS cm
+JOIN ClubMemberLocation AS current_cml
+    ON current_cml.MembershipNumber = cm.MembershipNumber
+   AND current_cml.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = current_cml.LocationID
+JOIN (
+    SELECT
+        MembershipNumber,
+        MIN(StartDate) AS JoinDate
+    FROM ClubMemberLocation
+    GROUP BY MembershipNumber
+) AS membership
+    ON membership.MembershipNumber = cm.MembershipNumber
+WHERE TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) >= 18
+  AND TIMESTAMPDIFF(YEAR, cm.DOB, membership.JoinDate) < 18
+ORDER BY
+    CurrentLocationName ASC,
+    Age ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q15' => [
+        'title' => 'Active members assigned only as Goalkeeper',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) AS Age,
+    cm.Phone,
+    cm.Email,
+    l.Name AS CurrentLocationName,
+    COUNT(DISTINCT p.GameID) AS NumberOfFIFAGames
+FROM ClubMember AS cm
+JOIN ClubMemberLocation AS current_cml
+    ON current_cml.MembershipNumber = cm.MembershipNumber
+   AND current_cml.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = current_cml.LocationID
+JOIN (
+    SELECT
+        MembershipNumber,
+        MIN(StartDate) AS JoinDate
+    FROM ClubMemberLocation
+    GROUP BY MembershipNumber
+) AS membership
+    ON membership.MembershipNumber = cm.MembershipNumber
+LEFT JOIN Participation AS p
+    ON p.MembershipNumber = cm.MembershipNumber
+WHERE EXISTS (
+    SELECT 1
+    FROM FormationAssignment AS goalkeeper_assignment
+    WHERE goalkeeper_assignment.MembershipNumber = cm.MembershipNumber
+      AND goalkeeper_assignment.Role = 'Goalkeeper'
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM FormationAssignment AS other_assignment
+    WHERE other_assignment.MembershipNumber = cm.MembershipNumber
+      AND other_assignment.Role <> 'Goalkeeper'
+)
+AND (
+    (
+        YEAR(membership.JoinDate) < YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE()) - 1
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(
+                YEAR,
+                cm.DOB,
+                CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+            ) < 18 THEN 100
+            ELSE 200
+        END
+    )
+    OR
+    (
+        YEAR(membership.JoinDate) = YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE())
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+            ELSE 200
+        END
+    )
+)
+GROUP BY
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    cm.DOB,
+    cm.Phone,
+    cm.Email,
+    l.Name
+ORDER BY
+    CurrentLocationName ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q16' => [
+        'title' => 'Members assigned to all five required roles',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) AS Age,
+    cm.Phone,
+    cm.Email,
+    l.Name AS CurrentLocationName
+FROM ClubMember AS cm
+JOIN ClubMemberLocation AS current_cml
+    ON current_cml.MembershipNumber = cm.MembershipNumber
+   AND current_cml.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = current_cml.LocationID
+JOIN (
+    SELECT
+        MembershipNumber,
+        MIN(StartDate) AS JoinDate
+    FROM ClubMemberLocation
+    GROUP BY MembershipNumber
+) AS membership
+    ON membership.MembershipNumber = cm.MembershipNumber
+JOIN FormationAssignment AS fa
+    ON fa.MembershipNumber = cm.MembershipNumber
+JOIN TeamFormation AS tf
+    ON tf.FormationID = fa.FormationID
+JOIN `Session` AS s
+    ON s.SessionID = tf.SessionID
+   AND s.SessionType = 'Game'
+WHERE fa.Role IN (
+    'Goalkeeper',
+    'Right fullback',
+    'Sweeper',
+    'Defending/holding midfielder',
+    'Striker'
+)
+AND (
+    (
+        YEAR(membership.JoinDate) < YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE()) - 1
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(
+                YEAR,
+                cm.DOB,
+                CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+            ) < 18 THEN 100
+            ELSE 200
+        END
+    )
+    OR
+    (
+        YEAR(membership.JoinDate) = YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE())
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+            ELSE 200
+        END
+    )
+)
+GROUP BY
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    cm.DOB,
+    cm.Phone,
+    cm.Email,
+    l.Name
+HAVING COUNT(DISTINCT fa.Role) = 5
+ORDER BY
+    CurrentLocationName ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q17' => [
+        'title' => 'Family members who are head coaches at the same location',
+        'sql' => <<<'SQL'
+/* Assumption: LocationID = 1. */
+SELECT DISTINCT
+    fm.FirstName,
+    fm.LastName,
+    fm.Phone
+FROM FamilyMember AS fm
+JOIN Personnel AS coach
+    ON coach.SSN = fm.SSN
+WHERE EXISTS (
+    SELECT 1
+    FROM TeamFormation AS tf
+    JOIN Team AS t
+        ON t.TeamID = tf.TeamID
+    WHERE tf.HeadCoachID = coach.PersonnelID
+      AND t.LocationID = 1
+)
+AND EXISTS (
+    SELECT 1
+    FROM Guardianship AS g
+    JOIN ClubMember AS cm
+        ON cm.MembershipNumber = g.MembershipNumber
+    JOIN ClubMemberLocation AS current_cml
+        ON current_cml.MembershipNumber = cm.MembershipNumber
+       AND current_cml.EndDate IS NULL
+       AND current_cml.LocationID = 1
+    WHERE g.FamilyMemberID = fm.FamilyMemberID
+      AND g.EndDate IS NULL
+      AND (
+          (
+              YEAR(
+                  (
+                      SELECT MIN(all_cml.StartDate)
+                      FROM ClubMemberLocation AS all_cml
+                      WHERE all_cml.MembershipNumber = cm.MembershipNumber
+                  )
+              ) < YEAR(CURDATE())
+              AND COALESCE(
+                  (
+                      SELECT SUM(pay.Amount)
+                      FROM Payment AS pay
+                      WHERE pay.MembershipNumber = cm.MembershipNumber
+                        AND pay.MembershipYear = YEAR(CURDATE()) - 1
+                  ),
+                  0
+              ) >= CASE
+                  WHEN TIMESTAMPDIFF(
+                      YEAR,
+                      cm.DOB,
+                      CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+                  ) < 18 THEN 100
+                  ELSE 200
+              END
+          )
+          OR
+          (
+              YEAR(
+                  (
+                      SELECT MIN(all_cml.StartDate)
+                      FROM ClubMemberLocation AS all_cml
+                      WHERE all_cml.MembershipNumber = cm.MembershipNumber
+                  )
+              ) = YEAR(CURDATE())
+              AND COALESCE(
+                  (
+                      SELECT SUM(pay.Amount)
+                      FROM Payment AS pay
+                      WHERE pay.MembershipNumber = cm.MembershipNumber
+                        AND pay.MembershipYear = YEAR(CURDATE())
+                  ),
+                  0
+              ) >= CASE
+                  WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+                  ELSE 200
+              END
+          )
+      )
+)
+ORDER BY
+    fm.FirstName ASC,
+    fm.LastName ASC
+SQL,
+    ],
+
+    'Q18' => [
+        'title' => 'Active members who have never won a formation game',
+        'sql' => <<<'SQL'
+SELECT
+    cm.MembershipNumber,
+    cm.FirstName,
+    cm.LastName,
+    TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) AS Age,
+    cm.Phone,
+    cm.Email,
+    l.Name AS CurrentLocationName
+FROM ClubMember AS cm
+JOIN ClubMemberLocation AS current_cml
+    ON current_cml.MembershipNumber = cm.MembershipNumber
+   AND current_cml.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = current_cml.LocationID
+JOIN (
+    SELECT
+        MembershipNumber,
+        MIN(StartDate) AS JoinDate
+    FROM ClubMemberLocation
+    GROUP BY MembershipNumber
+) AS membership
+    ON membership.MembershipNumber = cm.MembershipNumber
+WHERE EXISTS (
+    SELECT 1
+    FROM FormationAssignment AS played_assignment
+    JOIN TeamFormation AS played_formation
+        ON played_formation.FormationID = played_assignment.FormationID
+    JOIN `Session` AS played_session
+        ON played_session.SessionID = played_formation.SessionID
+    WHERE played_assignment.MembershipNumber = cm.MembershipNumber
+      AND played_session.SessionType = 'Game'
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM FormationAssignment AS winning_assignment
+    JOIN TeamFormation AS winning_formation
+        ON winning_formation.FormationID = winning_assignment.FormationID
+    JOIN `Session` AS winning_session
+        ON winning_session.SessionID = winning_formation.SessionID
+    JOIN TeamFormation AS opposing_formation
+        ON opposing_formation.SessionID = winning_formation.SessionID
+       AND opposing_formation.FormationID <> winning_formation.FormationID
+    WHERE winning_assignment.MembershipNumber = cm.MembershipNumber
+      AND winning_session.SessionType = 'Game'
+      AND winning_formation.Score IS NOT NULL
+      AND opposing_formation.Score IS NOT NULL
+      AND winning_formation.Score > opposing_formation.Score
+)
+AND (
+    (
+        YEAR(membership.JoinDate) < YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE()) - 1
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(
+                YEAR,
+                cm.DOB,
+                CONCAT(YEAR(CURDATE()) - 1, '-12-31')
+            ) < 18 THEN 100
+            ELSE 200
+        END
+    )
+    OR
+    (
+        YEAR(membership.JoinDate) = YEAR(CURDATE())
+        AND COALESCE(
+            (
+                SELECT SUM(pay.Amount)
+                FROM Payment AS pay
+                WHERE pay.MembershipNumber = cm.MembershipNumber
+                  AND pay.MembershipYear = YEAR(CURDATE())
+            ),
+            0
+        ) >= CASE
+            WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18 THEN 100
+            ELSE 200
+        END
+    )
+)
+ORDER BY
+    CurrentLocationName ASC,
+    cm.MembershipNumber ASC
+SQL,
+    ],
+
+    'Q19' => [
+        'title' => 'Volunteer personnel who are family members',
+        'sql' => <<<'SQL'
+SELECT
+    p.FirstName,
+    p.LastName,
+    COUNT(
+        DISTINCT CASE
+            WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18
+            THEN g.MembershipNumber
+        END
+    ) AS NumberOfAssociatedMinorMembers,
+    COUNT(
+        DISTINCT CASE
+            WHEN participation.GameID IS NOT NULL
+            THEN g.MembershipNumber
+        END
+    ) AS NumberOfMembersParticipatedInFIFAGame,
+    p.Phone,
+    p.Email,
+    l.Name AS CurrentLocationName,
+    pos.PositionName AS CurrentRole
+FROM Personnel AS p
+JOIN FamilyMember AS fm
+    ON fm.SSN = p.SSN
+JOIN WorksAt AS wa
+    ON wa.PersonnelID = p.PersonnelID
+   AND wa.EndDate IS NULL
+JOIN Location AS l
+    ON l.LocationID = wa.LocationID
+JOIN Position AS pos
+    ON pos.PositionID = wa.PositionID
+JOIN Guardianship AS g
+    ON g.FamilyMemberID = fm.FamilyMemberID
+   AND g.EndDate IS NULL
+JOIN ClubMember AS cm
+    ON cm.MembershipNumber = g.MembershipNumber
+LEFT JOIN Participation AS participation
+    ON participation.MembershipNumber = cm.MembershipNumber
+WHERE p.Mandate = 'Volunteer'
+GROUP BY
+    p.PersonnelID,
+    p.FirstName,
+    p.LastName,
+    p.Phone,
+    p.Email,
+    l.Name,
+    pos.PositionName
+HAVING COUNT(
+    DISTINCT CASE
+        WHEN TIMESTAMPDIFF(YEAR, cm.DOB, CURDATE()) < 18
+        THEN g.MembershipNumber
+    END
+) >= 1
+AND COUNT(
+    DISTINCT CASE
+        WHEN participation.GameID IS NOT NULL
+        THEN g.MembershipNumber
+    END
+) >= 1
+ORDER BY
+    CurrentLocationName ASC,
+    CurrentRole ASC,
+    p.FirstName ASC,
+    p.LastName ASC
+SQL,
+    ],
 ];
 
 $pdo = null;
@@ -530,6 +1355,7 @@ function payment_status_for_session(PDO $pdo, int $membershipNumber, string $ses
 
     $sessionDate = substr($sessionDateTime, 0, 10);
     $year = (int)substr($sessionDate, 0, 4);
+    $membershipYear = $sessionYear - 1;
     $age = age_on_date((string)$dob, $sessionDate);
     $required = $age >= 18 ? 200.0 : 100.0;
 
@@ -537,16 +1363,1040 @@ function payment_status_for_session(PDO $pdo, int $membershipNumber, string $ses
         'SELECT COALESCE(SUM(Amount), 0) FROM ' . qi('Payment')
         . ' WHERE MembershipNumber = :member AND MembershipYear = :year'
     );
-    $paymentStmt->execute(['member' => $membershipNumber, 'year' => $year]);
+    $paymentStmt->execute(['member' => $membershipNumber, 'year' => $membershipYear]);
     $paid = (float)$paymentStmt->fetchColumn();
 
     return [
-        'year' => $year,
+        'year' => $membershipYear,
         'age' => $age,
         'required' => $required,
         'paid' => $paid,
         'eligible' => $paid >= $required,
     ];
+}
+
+function workflow_required_int($value, string $label): int
+{
+    $validated = filter_var($value, FILTER_VALIDATE_INT);
+    if ($validated === false || (int)$validated <= 0) {
+        throw new InvalidArgumentException($label . ' is required.');
+    }
+
+    return (int)$validated;
+}
+
+function workflow_date($value, string $label, bool $required = true): ?string
+{
+    $value = trim((string)$value);
+    if ($value === '') {
+        if ($required) {
+            throw new InvalidArgumentException($label . ' is required.');
+        }
+        return null;
+    }
+
+    $date = DateTime::createFromFormat('Y-m-d', $value);
+    if (!$date || $date->format('Y-m-d') !== $value) {
+        throw new InvalidArgumentException($label . ' must be a valid date.');
+    }
+
+    return $value;
+}
+
+function workflow_period(string $startDate, ?string $endDate, string $label): void
+{
+    if ($endDate !== null && $endDate < $startDate) {
+        throw new InvalidArgumentException($label . ' end date cannot be earlier than the start date.');
+    }
+}
+
+function workflow_insert_row(PDO $pdo, string $table, array $fields): array
+{
+    assert_real_table($pdo, $table);
+    $columns = table_columns($pdo, $table);
+    $pkColumns = primary_key_columns($pdo, $table);
+    $insertColumns = [];
+    $placeholders = [];
+    $params = [];
+    $normalized = [];
+    $index = 0;
+
+    foreach ($columns as $columnName => $column) {
+        if (is_auto_increment($column)) {
+            continue;
+        }
+
+        if (!array_key_exists($columnName, $fields)) {
+            if (is_nullable($column) || ($column['Default'] ?? null) !== null) {
+                continue;
+            }
+            throw new InvalidArgumentException(humanize($columnName) . ' is required.');
+        }
+
+        $value = normalize_form_value($column, $fields[$columnName]);
+        $parameter = 'workflow_value_' . $index++;
+        $insertColumns[] = qi($columnName);
+        $placeholders[] = ':' . $parameter;
+        $params[$parameter] = $value;
+        $normalized[$columnName] = $value;
+    }
+
+    if ($insertColumns === []) {
+        $pdo->exec('INSERT INTO ' . qi($table) . ' () VALUES ()');
+    } else {
+        $stmt = $pdo->prepare(
+            'INSERT INTO ' . qi($table)
+            . ' (' . implode(', ', $insertColumns) . ')'
+            . ' VALUES (' . implode(', ', $placeholders) . ')'
+        );
+        $stmt->execute($params);
+    }
+
+    $pk = [];
+    foreach ($pkColumns as $pkColumn) {
+        $column = $columns[$pkColumn];
+        if (is_auto_increment($column)) {
+            $pk[$pkColumn] = (int)$pdo->lastInsertId();
+        } elseif (array_key_exists($pkColumn, $normalized)) {
+            $pk[$pkColumn] = $normalized[$pkColumn];
+        } else {
+            throw new RuntimeException('Could not determine the new ' . humanize($pkColumn) . '.');
+        }
+    }
+
+    return $pk;
+}
+
+function workflow_update_row(PDO $pdo, string $table, array $pk, array $fields): void
+{
+    assert_real_table($pdo, $table);
+    $columns = table_columns($pdo, $table);
+    $pkColumns = primary_key_columns($pdo, $table);
+    $sets = [];
+    $params = [];
+    $index = 0;
+
+    foreach ($columns as $columnName => $column) {
+        if (in_array($columnName, $pkColumns, true) || !array_key_exists($columnName, $fields)) {
+            continue;
+        }
+
+        $parameter = 'workflow_value_' . $index++;
+        $sets[] = qi($columnName) . ' = :' . $parameter;
+        $params[$parameter] = normalize_form_value($column, $fields[$columnName]);
+    }
+
+    if ($sets === []) {
+        throw new RuntimeException('No editable fields were submitted.');
+    }
+
+    $where = build_pk_where($pk, $params, 'workflow_pk');
+    $stmt = $pdo->prepare(
+        'UPDATE ' . qi($table) . ' SET ' . implode(', ', $sets) . ' WHERE ' . $where
+    );
+    $stmt->execute($params);
+}
+
+function workflow_delete_row(PDO $pdo, string $table, array $pk): void
+{
+    $params = [];
+    $where = build_pk_where($pk, $params, 'workflow_delete_pk');
+    $stmt = $pdo->prepare('DELETE FROM ' . qi($table) . ' WHERE ' . $where);
+    $stmt->execute($params);
+}
+
+function workflow_assert_no_period_overlap(
+    PDO $pdo,
+    string $table,
+    array $owners,
+    string $startDate,
+    ?string $endDate,
+    array $excludePk = []
+): void {
+    assert_real_table($pdo, $table);
+    $conditions = [];
+    $params = [];
+    $index = 0;
+
+    foreach ($owners as $column => $value) {
+        $parameter = 'owner_' . $index++;
+        $conditions[] = qi((string)$column) . ' = :' . $parameter;
+        $params[$parameter] = $value;
+    }
+
+    $conditions[] = "NOT (COALESCE(EndDate, '9999-12-31') < :period_start"
+        . " OR COALESCE(:period_end, '9999-12-31') < StartDate)";
+    $params['period_start'] = $startDate;
+    $params['period_end'] = $endDate;
+
+    if ($excludePk !== []) {
+        $excludeConditions = [];
+        $excludeIndex = 0;
+        foreach ($excludePk as $column => $value) {
+            $parameter = 'exclude_' . $excludeIndex++;
+            $excludeConditions[] = qi((string)$column) . ' = :' . $parameter;
+            $params[$parameter] = $value;
+        }
+        $conditions[] = 'NOT (' . implode(' AND ', $excludeConditions) . ')';
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM ' . qi($table) . ' WHERE ' . implode(' AND ', $conditions)
+    );
+    $stmt->execute($params);
+
+    if ((int)$stmt->fetchColumn() > 0) {
+        throw new RuntimeException('The selected date period overlaps an existing record.');
+    }
+}
+
+function workflow_location_options(PDO $pdo): array
+{
+    return reference_options($pdo, 'Location', 'LocationID');
+}
+
+function workflow_position_options(PDO $pdo): array
+{
+    return reference_options($pdo, 'Position', 'PositionID');
+}
+
+function workflow_family_member_options(PDO $pdo): array
+{
+    return reference_options($pdo, 'FamilyMember', 'FamilyMemberID');
+}
+
+function workflow_relationship_values(PDO $pdo): array
+{
+    $column = table_columns($pdo, 'Guardianship')['RelationshipType'] ?? null;
+    if ($column) {
+        $values = enum_values((string)$column['Type']);
+        if ($values !== []) {
+            return $values;
+        }
+    }
+
+    return ['Father', 'Mother', 'Grandfather', 'Grandmother', 'Tutor', 'Partner', 'Friend', 'Other'];
+}
+
+function workflow_relationship_is_current(string $startDate, ?string $endDate, ?string $asOf = null): bool
+{
+    $asOf = $asOf ?? date('Y-m-d');
+    return $startDate <= $asOf && ($endDate === null || $endDate >= $asOf);
+}
+
+function workflow_member_is_minor(PDO $pdo, int $membershipNumber, ?string $asOf = null): bool
+{
+    $stmt = $pdo->prepare('SELECT DOB FROM ' . qi('ClubMember') . ' WHERE MembershipNumber = :member');
+    $stmt->execute(['member' => $membershipNumber]);
+    $dob = $stmt->fetchColumn();
+    if ($dob === false) {
+        throw new RuntimeException('The selected club member does not exist.');
+    }
+
+    $asOf = $asOf ?? date('Y-m-d');
+    return age_on_date((string)$dob, $asOf) < 18;
+}
+
+function workflow_assert_minor_keeps_current_guardian(
+    PDO $pdo,
+    int $membershipNumber,
+    int $familyMemberId,
+    string $startDate
+): void {
+    if (!workflow_member_is_minor($pdo, $membershipNumber)) {
+        return;
+    }
+
+    $rowStmt = $pdo->prepare(
+        'SELECT StartDate, EndDate FROM ' . qi('Guardianship')
+        . ' WHERE MembershipNumber = :member AND FamilyMemberID = :family_member AND StartDate = :start_date'
+    );
+    $rowStmt->execute([
+        'member' => $membershipNumber,
+        'family_member' => $familyMemberId,
+        'start_date' => $startDate,
+    ]);
+    $row = $rowStmt->fetch();
+    if ($row === false || !workflow_relationship_is_current((string)$row['StartDate'], $row['EndDate'] === null ? null : (string)$row['EndDate'])) {
+        return;
+    }
+
+    $countStmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM ' . qi('Guardianship')
+        . ' WHERE MembershipNumber = :member'
+        . ' AND StartDate <= CURDATE() AND (EndDate IS NULL OR EndDate >= CURDATE())'
+        . ' AND NOT (FamilyMemberID = :family_member AND StartDate = :start_date)'
+    );
+    $countStmt->execute([
+        'member' => $membershipNumber,
+        'family_member' => $familyMemberId,
+        'start_date' => $startDate,
+    ]);
+
+    if ((int)$countStmt->fetchColumn() === 0) {
+        throw new RuntimeException('This relationship cannot be removed because the minor member would have no current family member.');
+    }
+}
+
+function workflow_location_label_expression(PDO $pdo, string $alias = 'l'): string
+{
+    $column = first_existing_column($pdo, 'Location', ['LocationName', 'Name']);
+    if ($column !== null) {
+        return $alias . '.' . qi($column);
+    }
+
+    return "CONCAT('Location #', " . $alias . '.' . qi('LocationID') . ')';
+}
+
+function workflow_render_base_fields(PDO $pdo, string $table, array $row, bool $editing): void
+{
+    $columns = table_columns($pdo, $table);
+    $pkColumns = primary_key_columns($pdo, $table);
+
+    foreach ($columns as $columnName => $column) {
+        if (!$editing && is_auto_increment($column)) {
+            continue;
+        }
+        render_generic_field(
+            $pdo,
+            $table,
+            $columnName,
+            $column,
+            $row[$columnName] ?? ($column['Default'] ?? ''),
+            $editing,
+            $pkColumns
+        );
+    }
+}
+
+function handle_personnel_save(PDO $pdo): void
+{
+    foreach (['Personnel', 'WorksAt', 'Location', 'Position'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $fields = is_array($_POST['field'] ?? null) ? $_POST['field'] : [];
+
+    if ($mode === 'update') {
+        $personnelId = workflow_required_int($_POST['personnel_id'] ?? null, 'Personnel');
+        workflow_update_row($pdo, 'Personnel', ['PersonnelID' => $personnelId], $fields);
+        flash('success', 'Personnel record updated successfully.');
+        redirect_to(['page' => 'personnel']);
+    }
+
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Initial location');
+    $positionId = workflow_required_int($_POST['position_id'] ?? null, 'Initial position');
+    $startDate = workflow_date($_POST['assignment_start_date'] ?? '', 'Assignment start date');
+    $endDate = workflow_date($_POST['assignment_end_date'] ?? '', 'Assignment end date', false);
+    workflow_period($startDate, $endDate, 'Personnel assignment');
+
+    $pdo->beginTransaction();
+    try {
+        $pk = workflow_insert_row($pdo, 'Personnel', $fields);
+        $personnelId = (int)($pk['PersonnelID'] ?? 0);
+        if ($personnelId <= 0) {
+            throw new RuntimeException('Could not determine the new personnel ID.');
+        }
+
+        $stmt = $pdo->prepare(
+            'INSERT INTO ' . qi('WorksAt')
+            . ' (PersonnelID, LocationID, StartDate, PositionID, EndDate)'
+            . ' VALUES (:personnel, :location, :start_date, :position, :end_date)'
+        );
+        $stmt->execute([
+            'personnel' => $personnelId,
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'position' => $positionId,
+            'end_date' => $endDate,
+        ]);
+
+        $pdo->commit();
+        flash('success', 'Personnel record and initial assignment created successfully.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'personnel']);
+}
+
+function handle_personnel_delete(PDO $pdo): void
+{
+    $personnelId = workflow_required_int($_POST['personnel_id'] ?? null, 'Personnel');
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('DELETE FROM ' . qi('WorksAt') . ' WHERE PersonnelID = :personnel');
+        $stmt->execute(['personnel' => $personnelId]);
+        workflow_delete_row($pdo, 'Personnel', ['PersonnelID' => $personnelId]);
+        $pdo->commit();
+        flash('success', 'Personnel record deleted.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'personnel']);
+}
+
+function handle_worksat_save(PDO $pdo): void
+{
+    foreach (['WorksAt', 'Personnel', 'Location', 'Position'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $personnelId = workflow_required_int($_POST['personnel_id'] ?? null, 'Personnel');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $positionId = workflow_required_int($_POST['position_id'] ?? null, 'Position');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $endDate = workflow_date($_POST['end_date'] ?? '', 'End date', false);
+    workflow_period($startDate, $endDate, 'Personnel assignment');
+
+    $exclude = [];
+    if ($mode === 'update') {
+        $exclude = [
+            'PersonnelID' => $personnelId,
+            'LocationID' => workflow_required_int($_POST['old_location_id'] ?? null, 'Original location'),
+            'StartDate' => workflow_date($_POST['old_start_date'] ?? '', 'Original start date'),
+        ];
+    }
+
+    workflow_assert_no_period_overlap(
+        $pdo,
+        'WorksAt',
+        ['PersonnelID' => $personnelId],
+        $startDate,
+        $endDate,
+        $exclude
+    );
+
+    if ($mode === 'update') {
+        $stmt = $pdo->prepare(
+            'UPDATE ' . qi('WorksAt')
+            . ' SET LocationID = :location, StartDate = :start_date, PositionID = :position, EndDate = :end_date'
+            . ' WHERE PersonnelID = :personnel AND LocationID = :old_location AND StartDate = :old_start_date'
+        );
+        $stmt->execute([
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'position' => $positionId,
+            'end_date' => $endDate,
+            'personnel' => $personnelId,
+            'old_location' => $exclude['LocationID'],
+            'old_start_date' => $exclude['StartDate'],
+        ]);
+        flash('success', 'Personnel assignment updated.');
+    } else {
+        $stmt = $pdo->prepare(
+            'INSERT INTO ' . qi('WorksAt')
+            . ' (PersonnelID, LocationID, StartDate, PositionID, EndDate)'
+            . ' VALUES (:personnel, :location, :start_date, :position, :end_date)'
+        );
+        $stmt->execute([
+            'personnel' => $personnelId,
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'position' => $positionId,
+            'end_date' => $endDate,
+        ]);
+        flash('success', 'Personnel assignment added.');
+    }
+
+    redirect_to(['page' => 'personnel', 'mode' => 'assignments', 'id' => $personnelId]);
+}
+
+function handle_worksat_delete(PDO $pdo): void
+{
+    $personnelId = workflow_required_int($_POST['personnel_id'] ?? null, 'Personnel');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+
+    $stmt = $pdo->prepare(
+        'DELETE FROM ' . qi('WorksAt')
+        . ' WHERE PersonnelID = :personnel AND LocationID = :location AND StartDate = :start_date'
+    );
+    $stmt->execute([
+        'personnel' => $personnelId,
+        'location' => $locationId,
+        'start_date' => $startDate,
+    ]);
+
+    flash('success', 'Personnel assignment deleted.');
+    redirect_to(['page' => 'personnel', 'mode' => 'assignments', 'id' => $personnelId]);
+}
+
+function handle_family_member_save(PDO $pdo): void
+{
+    foreach (['FamilyMember', 'FamilyMemberLocation', 'Guardianship', 'Location', 'ClubMember'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $fields = is_array($_POST['field'] ?? null) ? $_POST['field'] : [];
+
+    if ($mode === 'update') {
+        $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+        workflow_update_row($pdo, 'FamilyMember', ['FamilyMemberID' => $familyMemberId], $fields);
+        flash('success', 'Family member updated successfully.');
+        redirect_to(['page' => 'family_members']);
+    }
+
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Initial location');
+    $locationStart = workflow_date($_POST['location_start_date'] ?? '', 'Location start date');
+    $locationEnd = workflow_date($_POST['location_end_date'] ?? '', 'Location end date', false);
+    workflow_period($locationStart, $locationEnd, 'Family-member location');
+
+    $membershipRaw = trim((string)($_POST['membership_number'] ?? ''));
+    $membershipNumber = $membershipRaw === '' ? null : workflow_required_int($membershipRaw, 'Associated club member');
+    $relationshipType = trim((string)($_POST['relationship_type'] ?? ''));
+    $isPrimary = isset($_POST['is_primary']) ? (int)$_POST['is_primary'] : 1;
+    $relationshipStart = null;
+    $relationshipEnd = null;
+
+    if ($membershipNumber !== null) {
+        $relationshipStart = workflow_date($_POST['relationship_start_date'] ?? '', 'Relationship start date');
+        $relationshipEnd = workflow_date($_POST['relationship_end_date'] ?? '', 'Relationship end date', false);
+        workflow_period($relationshipStart, $relationshipEnd, 'Family relationship');
+        if (!in_array($relationshipType, workflow_relationship_values($pdo), true)) {
+            throw new InvalidArgumentException('Select a valid relationship type.');
+        }
+        if (!in_array($isPrimary, [0, 1], true)) {
+            throw new InvalidArgumentException('Primary/Secondary selection is invalid.');
+        }
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $pk = workflow_insert_row($pdo, 'FamilyMember', $fields);
+        $familyMemberId = (int)($pk['FamilyMemberID'] ?? 0);
+        if ($familyMemberId <= 0) {
+            throw new RuntimeException('Could not determine the new family member ID.');
+        }
+
+        $locationStmt = $pdo->prepare(
+            'INSERT INTO ' . qi('FamilyMemberLocation')
+            . ' (FamilyMemberID, LocationID, StartDate, EndDate)'
+            . ' VALUES (:family_member, :location, :start_date, :end_date)'
+        );
+        $locationStmt->execute([
+            'family_member' => $familyMemberId,
+            'location' => $locationId,
+            'start_date' => $locationStart,
+            'end_date' => $locationEnd,
+        ]);
+
+        if ($membershipNumber !== null) {
+            $guardianStmt = $pdo->prepare(
+                'INSERT INTO ' . qi('Guardianship')
+                . ' (MembershipNumber, FamilyMemberID, StartDate, RelationshipType, IsPrimary, EndDate)'
+                . ' VALUES (:member, :family_member, :start_date, :relationship, :is_primary, :end_date)'
+            );
+            $guardianStmt->execute([
+                'member' => $membershipNumber,
+                'family_member' => $familyMemberId,
+                'start_date' => $relationshipStart,
+                'relationship' => $relationshipType,
+                'is_primary' => $isPrimary,
+                'end_date' => $relationshipEnd,
+            ]);
+        }
+
+        $pdo->commit();
+        flash('success', 'Family member and related records created successfully.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'family_members']);
+}
+
+function handle_family_member_delete(PDO $pdo): void
+{
+    $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+    $relationshipStmt = $pdo->prepare(
+        'SELECT DISTINCT MembershipNumber FROM ' . qi('Guardianship')
+        . ' WHERE FamilyMemberID = :family_member'
+        . ' AND StartDate <= CURDATE() AND (EndDate IS NULL OR EndDate >= CURDATE())'
+    );
+    $relationshipStmt->execute(['family_member' => $familyMemberId]);
+    foreach ($relationshipStmt->fetchAll() as $relationship) {
+        $membershipNumber = (int)$relationship['MembershipNumber'];
+        if (!workflow_member_is_minor($pdo, $membershipNumber)) {
+            continue;
+        }
+        $otherStmt = $pdo->prepare(
+            'SELECT COUNT(*) FROM ' . qi('Guardianship')
+            . ' WHERE MembershipNumber = :member AND FamilyMemberID <> :family_member'
+            . ' AND StartDate <= CURDATE() AND (EndDate IS NULL OR EndDate >= CURDATE())'
+        );
+        $otherStmt->execute(['member' => $membershipNumber, 'family_member' => $familyMemberId]);
+        if ((int)$otherStmt->fetchColumn() === 0) {
+            throw new RuntimeException(
+                'This family member cannot be deleted because minor member #'
+                . $membershipNumber . ' would have no current family member.'
+            );
+        }
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('DELETE FROM ' . qi('Guardianship') . ' WHERE FamilyMemberID = :family_member');
+        $stmt->execute(['family_member' => $familyMemberId]);
+        $stmt = $pdo->prepare('DELETE FROM ' . qi('FamilyMemberLocation') . ' WHERE FamilyMemberID = :family_member');
+        $stmt->execute(['family_member' => $familyMemberId]);
+        workflow_delete_row($pdo, 'FamilyMember', ['FamilyMemberID' => $familyMemberId]);
+        $pdo->commit();
+        flash('success', 'Family member deleted.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'family_members']);
+}
+
+function handle_family_location_save(PDO $pdo): void
+{
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $endDate = workflow_date($_POST['end_date'] ?? '', 'End date', false);
+    workflow_period($startDate, $endDate, 'Family-member location');
+
+    $exclude = [];
+    if ($mode === 'update') {
+        $exclude = [
+            'FamilyMemberID' => $familyMemberId,
+            'LocationID' => workflow_required_int($_POST['old_location_id'] ?? null, 'Original location'),
+            'StartDate' => workflow_date($_POST['old_start_date'] ?? '', 'Original start date'),
+        ];
+    }
+
+    workflow_assert_no_period_overlap(
+        $pdo,
+        'FamilyMemberLocation',
+        ['FamilyMemberID' => $familyMemberId],
+        $startDate,
+        $endDate,
+        $exclude
+    );
+
+    if ($mode === 'update') {
+        $stmt = $pdo->prepare(
+            'UPDATE ' . qi('FamilyMemberLocation')
+            . ' SET LocationID = :location, StartDate = :start_date, EndDate = :end_date'
+            . ' WHERE FamilyMemberID = :family_member AND LocationID = :old_location AND StartDate = :old_start_date'
+        );
+        $stmt->execute([
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+            'family_member' => $familyMemberId,
+            'old_location' => $exclude['LocationID'],
+            'old_start_date' => $exclude['StartDate'],
+        ]);
+        flash('success', 'Family-member location updated.');
+    } else {
+        $stmt = $pdo->prepare(
+            'INSERT INTO ' . qi('FamilyMemberLocation')
+            . ' (FamilyMemberID, LocationID, StartDate, EndDate)'
+            . ' VALUES (:family_member, :location, :start_date, :end_date)'
+        );
+        $stmt->execute([
+            'family_member' => $familyMemberId,
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+        ]);
+        flash('success', 'Family-member location added.');
+    }
+
+    redirect_to(['page' => 'family_members', 'mode' => 'locations', 'id' => $familyMemberId]);
+}
+
+function handle_family_location_delete(PDO $pdo): void
+{
+    $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $stmt = $pdo->prepare(
+        'DELETE FROM ' . qi('FamilyMemberLocation')
+        . ' WHERE FamilyMemberID = :family_member AND LocationID = :location AND StartDate = :start_date'
+    );
+    $stmt->execute([
+        'family_member' => $familyMemberId,
+        'location' => $locationId,
+        'start_date' => $startDate,
+    ]);
+    flash('success', 'Family-member location deleted.');
+    redirect_to(['page' => 'family_members', 'mode' => 'locations', 'id' => $familyMemberId]);
+}
+
+function handle_guardianship_save(PDO $pdo): void
+{
+    foreach (['Guardianship', 'FamilyMember', 'ClubMember'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $endDate = workflow_date($_POST['end_date'] ?? '', 'End date', false);
+    workflow_period($startDate, $endDate, 'Family relationship');
+    $relationshipType = trim((string)($_POST['relationship_type'] ?? ''));
+    $isPrimary = isset($_POST['is_primary']) ? (int)$_POST['is_primary'] : -1;
+
+    if (!in_array($relationshipType, workflow_relationship_values($pdo), true)) {
+        throw new InvalidArgumentException('Select a valid relationship type.');
+    }
+    if (!in_array($isPrimary, [0, 1], true)) {
+        throw new InvalidArgumentException('Select Primary or Secondary.');
+    }
+
+    $exclude = [];
+    if ($mode === 'update') {
+        $exclude = [
+            'MembershipNumber' => workflow_required_int($_POST['old_membership_number'] ?? null, 'Original club member'),
+            'FamilyMemberID' => workflow_required_int($_POST['old_family_member_id'] ?? null, 'Original family member'),
+            'StartDate' => workflow_date($_POST['old_start_date'] ?? '', 'Original start date'),
+        ];
+
+        $sameMemberKeepsCurrentRelationship =
+            $exclude['MembershipNumber'] === $membershipNumber
+            && workflow_relationship_is_current($startDate, $endDate);
+        if (!$sameMemberKeepsCurrentRelationship) {
+            workflow_assert_minor_keeps_current_guardian(
+                $pdo,
+                (int)$exclude['MembershipNumber'],
+                (int)$exclude['FamilyMemberID'],
+                (string)$exclude['StartDate']
+            );
+        }
+    }
+
+    workflow_assert_no_period_overlap(
+        $pdo,
+        'Guardianship',
+        ['MembershipNumber' => $membershipNumber, 'FamilyMemberID' => $familyMemberId],
+        $startDate,
+        $endDate,
+        $exclude
+    );
+
+    $pdo->beginTransaction();
+    try {
+        if ($mode === 'update') {
+            $stmt = $pdo->prepare(
+                'UPDATE ' . qi('Guardianship')
+                . ' SET MembershipNumber = :member, FamilyMemberID = :family_member, StartDate = :start_date,'
+                . ' RelationshipType = :relationship, IsPrimary = :is_primary, EndDate = :end_date'
+                . ' WHERE MembershipNumber = :old_member AND FamilyMemberID = :old_family_member AND StartDate = :old_start_date'
+            );
+            $stmt->execute([
+                'member' => $membershipNumber,
+                'family_member' => $familyMemberId,
+                'start_date' => $startDate,
+                'relationship' => $relationshipType,
+                'is_primary' => $isPrimary,
+                'end_date' => $endDate,
+                'old_member' => $exclude['MembershipNumber'],
+                'old_family_member' => $exclude['FamilyMemberID'],
+                'old_start_date' => $exclude['StartDate'],
+            ]);
+            flash('success', 'Family relationship updated.');
+        } else {
+            $stmt = $pdo->prepare(
+                'INSERT INTO ' . qi('Guardianship')
+                . ' (MembershipNumber, FamilyMemberID, StartDate, RelationshipType, IsPrimary, EndDate)'
+                . ' VALUES (:member, :family_member, :start_date, :relationship, :is_primary, :end_date)'
+            );
+            $stmt->execute([
+                'member' => $membershipNumber,
+                'family_member' => $familyMemberId,
+                'start_date' => $startDate,
+                'relationship' => $relationshipType,
+                'is_primary' => $isPrimary,
+                'end_date' => $endDate,
+            ]);
+            flash('success', 'Family relationship added.');
+        }
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    $returnPage = (string)($_POST['relationship_return_page'] ?? 'family_members');
+    if ($returnPage === 'club_members') {
+        redirect_to(['page' => 'club_members', 'mode' => 'guardians', 'id' => $membershipNumber]);
+    }
+    redirect_to(['page' => 'family_members', 'mode' => 'relationships', 'id' => $familyMemberId]);
+}
+
+function handle_guardianship_delete(PDO $pdo): void
+{
+    $familyMemberId = workflow_required_int($_POST['family_member_id'] ?? null, 'Family member');
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+
+    workflow_assert_minor_keeps_current_guardian($pdo, $membershipNumber, $familyMemberId, $startDate);
+
+    $stmt = $pdo->prepare(
+        'DELETE FROM ' . qi('Guardianship')
+        . ' WHERE MembershipNumber = :member AND FamilyMemberID = :family_member AND StartDate = :start_date'
+    );
+    $stmt->execute([
+        'member' => $membershipNumber,
+        'family_member' => $familyMemberId,
+        'start_date' => $startDate,
+    ]);
+    flash('success', 'Family relationship deleted.');
+
+    $returnPage = (string)($_POST['relationship_return_page'] ?? 'family_members');
+    if ($returnPage === 'club_members') {
+        redirect_to(['page' => 'club_members', 'mode' => 'guardians', 'id' => $membershipNumber]);
+    }
+    redirect_to(['page' => 'family_members', 'mode' => 'relationships', 'id' => $familyMemberId]);
+}
+
+function handle_club_member_save(PDO $pdo): void
+{
+    foreach (['ClubMember', 'ClubMemberLocation', 'Guardianship', 'Location', 'FamilyMember'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $fields = is_array($_POST['field'] ?? null) ? $_POST['field'] : [];
+    $dob = workflow_date($fields['DOB'] ?? '', 'Date of birth');
+    $currentAge = age_on_date($dob, date('Y-m-d'));
+
+    if ($mode === 'update') {
+        if ($currentAge < 4) {
+            throw new InvalidArgumentException('A club member must be at least four years old.');
+        }
+        $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+        $pdo->beginTransaction();
+        try {
+            workflow_update_row($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber], $fields);
+            if ($currentAge < 18) {
+                $stmt = $pdo->prepare(
+                    'SELECT COUNT(*) FROM ' . qi('Guardianship')
+                    . ' WHERE MembershipNumber = :member'
+                    . ' AND StartDate <= CURDATE() AND (EndDate IS NULL OR EndDate >= CURDATE())'
+                );
+                $stmt->execute(['member' => $membershipNumber]);
+                if ((int)$stmt->fetchColumn() === 0) {
+                    throw new RuntimeException('A minor club member must have at least one current family-member relationship.');
+                }
+            }
+            $pdo->commit();
+            flash('success', 'Club member updated successfully.');
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        redirect_to(['page' => 'club_members']);
+    }
+
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Initial location');
+    $locationStart = workflow_date($_POST['location_start_date'] ?? '', 'Location start date');
+    $locationEnd = workflow_date($_POST['location_end_date'] ?? '', 'Location end date', false);
+    workflow_period($locationStart, $locationEnd, 'Club-member location');
+
+    $registrationAge = age_on_date($dob, $locationStart);
+    if ($registrationAge < 4) {
+        throw new InvalidArgumentException('A new club member must be at least four years old on the registration date.');
+    }
+
+    $familyRaw = trim((string)($_POST['family_member_id'] ?? ''));
+    $familyMemberId = $familyRaw === '' ? null : workflow_required_int($familyRaw, 'Family member');
+    if ($registrationAge < 18 && $familyMemberId === null) {
+        throw new InvalidArgumentException('A minor club member must be associated with a family member.');
+    }
+
+    $relationshipType = trim((string)($_POST['relationship_type'] ?? ''));
+    $isPrimary = isset($_POST['is_primary']) ? (int)$_POST['is_primary'] : 1;
+    $relationshipStart = null;
+    $relationshipEnd = null;
+    if ($familyMemberId !== null) {
+        $relationshipStart = workflow_date($_POST['relationship_start_date'] ?? '', 'Relationship start date');
+        $relationshipEnd = workflow_date($_POST['relationship_end_date'] ?? '', 'Relationship end date', false);
+        workflow_period($relationshipStart, $relationshipEnd, 'Family relationship');
+        if (!in_array($relationshipType, workflow_relationship_values($pdo), true)) {
+            throw new InvalidArgumentException('Select a valid relationship type.');
+        }
+        if (!in_array($isPrimary, [0, 1], true)) {
+            throw new InvalidArgumentException('Select Primary or Secondary.');
+        }
+        if ($registrationAge < 18
+            && !workflow_relationship_is_current($relationshipStart, $relationshipEnd, $locationStart)) {
+            throw new InvalidArgumentException('A minor club member must have a family relationship active on the registration date.');
+        }
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $pk = workflow_insert_row($pdo, 'ClubMember', $fields);
+        $membershipNumber = (int)($pk['MembershipNumber'] ?? 0);
+        if ($membershipNumber <= 0) {
+            throw new RuntimeException('Could not determine the new membership number.');
+        }
+
+        $locationStmt = $pdo->prepare(
+            'INSERT INTO ' . qi('ClubMemberLocation')
+            . ' (MembershipNumber, LocationID, StartDate, EndDate)'
+            . ' VALUES (:member, :location, :start_date, :end_date)'
+        );
+        $locationStmt->execute([
+            'member' => $membershipNumber,
+            'location' => $locationId,
+            'start_date' => $locationStart,
+            'end_date' => $locationEnd,
+        ]);
+
+        if ($familyMemberId !== null) {
+            $guardianStmt = $pdo->prepare(
+                'INSERT INTO ' . qi('Guardianship')
+                . ' (MembershipNumber, FamilyMemberID, StartDate, RelationshipType, IsPrimary, EndDate)'
+                . ' VALUES (:member, :family_member, :start_date, :relationship, :is_primary, :end_date)'
+            );
+            $guardianStmt->execute([
+                'member' => $membershipNumber,
+                'family_member' => $familyMemberId,
+                'start_date' => $relationshipStart,
+                'relationship' => $relationshipType,
+                'is_primary' => $isPrimary,
+                'end_date' => $relationshipEnd,
+            ]);
+        }
+
+        $pdo->commit();
+        flash('success', 'Club member, location, and family relationship were created successfully.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'club_members']);
+}
+
+function handle_club_member_delete(PDO $pdo): void
+{
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('DELETE FROM ' . qi('Guardianship') . ' WHERE MembershipNumber = :member');
+        $stmt->execute(['member' => $membershipNumber]);
+        $stmt = $pdo->prepare('DELETE FROM ' . qi('ClubMemberLocation') . ' WHERE MembershipNumber = :member');
+        $stmt->execute(['member' => $membershipNumber]);
+        workflow_delete_row($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber]);
+        $pdo->commit();
+        flash('success', 'Club member deleted.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'club_members']);
+}
+
+function handle_club_location_save(PDO $pdo): void
+{
+    $mode = (string)($_POST['mode'] ?? 'insert');
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $endDate = workflow_date($_POST['end_date'] ?? '', 'End date', false);
+    workflow_period($startDate, $endDate, 'Club-member location');
+
+    $exclude = [];
+    if ($mode === 'update') {
+        $exclude = [
+            'MembershipNumber' => $membershipNumber,
+            'LocationID' => workflow_required_int($_POST['old_location_id'] ?? null, 'Original location'),
+            'StartDate' => workflow_date($_POST['old_start_date'] ?? '', 'Original start date'),
+        ];
+    }
+
+    workflow_assert_no_period_overlap(
+        $pdo,
+        'ClubMemberLocation',
+        ['MembershipNumber' => $membershipNumber],
+        $startDate,
+        $endDate,
+        $exclude
+    );
+
+    if ($mode === 'update') {
+        $stmt = $pdo->prepare(
+            'UPDATE ' . qi('ClubMemberLocation')
+            . ' SET LocationID = :location, StartDate = :start_date, EndDate = :end_date'
+            . ' WHERE MembershipNumber = :member AND LocationID = :old_location AND StartDate = :old_start_date'
+        );
+        $stmt->execute([
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+            'member' => $membershipNumber,
+            'old_location' => $exclude['LocationID'],
+            'old_start_date' => $exclude['StartDate'],
+        ]);
+        flash('success', 'Club-member location updated.');
+    } else {
+        $stmt = $pdo->prepare(
+            'INSERT INTO ' . qi('ClubMemberLocation')
+            . ' (MembershipNumber, LocationID, StartDate, EndDate)'
+            . ' VALUES (:member, :location, :start_date, :end_date)'
+        );
+        $stmt->execute([
+            'member' => $membershipNumber,
+            'location' => $locationId,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+        ]);
+        flash('success', 'Club-member location added.');
+    }
+
+    redirect_to(['page' => 'club_members', 'mode' => 'locations', 'id' => $membershipNumber]);
+}
+
+function handle_club_location_delete(PDO $pdo): void
+{
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $locationId = workflow_required_int($_POST['location_id'] ?? null, 'Location');
+    $startDate = workflow_date($_POST['start_date'] ?? '', 'Start date');
+    $stmt = $pdo->prepare(
+        'DELETE FROM ' . qi('ClubMemberLocation')
+        . ' WHERE MembershipNumber = :member AND LocationID = :location AND StartDate = :start_date'
+    );
+    $stmt->execute([
+        'member' => $membershipNumber,
+        'location' => $locationId,
+        'start_date' => $startDate,
+    ]);
+    flash('success', 'Club-member location deleted.');
+    redirect_to(['page' => 'club_members', 'mode' => 'locations', 'id' => $membershipNumber]);
 }
 
 
@@ -738,6 +2588,381 @@ function handle_create_session_with_formations(PDO $pdo): void
     redirect_to(['page' => 'formations']);
 }
 
+function workflow_session_form_input(): array
+{
+    $dateTime = trim((string)($_POST['session_datetime'] ?? ''));
+    $dateTime = str_replace('T', ' ', $dateTime);
+    if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/', $dateTime)) {
+        $dateTime .= ':00';
+    }
+    $date = DateTime::createFromFormat('Y-m-d H:i:s', $dateTime);
+    if (!$date || $date->format('Y-m-d H:i:s') !== $dateTime) {
+        throw new InvalidArgumentException('Enter a valid session date and time.');
+    }
+
+    $address = trim((string)($_POST['address'] ?? ''));
+    $type = (string)($_POST['session_type'] ?? '');
+    $team1 = workflow_required_int($_POST['team_1'] ?? null, 'Team 1');
+    $team2 = workflow_required_int($_POST['team_2'] ?? null, 'Team 2');
+    $coach1 = workflow_required_int($_POST['coach_1'] ?? null, 'Team 1 head coach');
+    $coach2 = workflow_required_int($_POST['coach_2'] ?? null, 'Team 2 head coach');
+    $score1Raw = trim((string)($_POST['score_1'] ?? ''));
+    $score2Raw = trim((string)($_POST['score_2'] ?? ''));
+
+    if ($address === '') {
+        throw new InvalidArgumentException('Session address is required.');
+    }
+    if (!in_array($type, ['Training', 'Game'], true)) {
+        throw new InvalidArgumentException('Session type must be Training or Game.');
+    }
+    if ($team1 === $team2) {
+        throw new InvalidArgumentException('A session must contain two different teams.');
+    }
+
+    $score1 = $score1Raw === '' ? null : filter_var($score1Raw, FILTER_VALIDATE_INT);
+    $score2 = $score2Raw === '' ? null : filter_var($score2Raw, FILTER_VALIDATE_INT);
+    if ($score1 === false || $score2 === false || ($score1 !== null && $score1 < 0) || ($score2 !== null && $score2 < 0)) {
+        throw new InvalidArgumentException('Scores must be blank or non-negative integers.');
+    }
+    if ($type === 'Training') {
+        $score1 = null;
+        $score2 = null;
+    }
+
+    return [
+        'session_datetime' => $dateTime,
+        'address' => $address,
+        'session_type' => $type,
+        'formations' => [
+            ['team_id' => $team1, 'coach_id' => $coach1, 'score' => $score1],
+            ['team_id' => $team2, 'coach_id' => $coach2, 'score' => $score2],
+        ],
+    ];
+}
+
+function workflow_session_bundle(PDO $pdo, int $sessionId): array
+{
+    $sessionStmt = $pdo->prepare(
+        'SELECT SessionID, SessionDateTime, Address, SessionType FROM ' . qi('Session')
+        . ' WHERE SessionID = :session'
+    );
+    $sessionStmt->execute(['session' => $sessionId]);
+    $session = $sessionStmt->fetch();
+    if ($session === false) {
+        throw new RuntimeException('The selected session does not exist.');
+    }
+
+    $formationStmt = $pdo->prepare(
+        'SELECT FormationID, SessionID, TeamID, HeadCoachID, Score FROM ' . qi('TeamFormation')
+        . ' WHERE SessionID = :session ORDER BY FormationID'
+    );
+    $formationStmt->execute(['session' => $sessionId]);
+    $formations = $formationStmt->fetchAll();
+    if (count($formations) < 1 || count($formations) > 2) {
+        throw new RuntimeException('This workflow supports sessions containing one or two team formations.');
+    }
+
+    return ['session' => $session, 'formations' => $formations];
+}
+
+function workflow_assert_session_time_has_no_conflicts(PDO $pdo, int $sessionId, string $newDateTime): void
+{
+    $stmt = $pdo->prepare(
+        'SELECT ownFa.MembershipNumber, otherTf.FormationID, otherS.SessionDateTime'
+        . ' FROM ' . qi('FormationAssignment') . ' ownFa'
+        . ' JOIN ' . qi('TeamFormation') . ' ownTf ON ownTf.FormationID = ownFa.FormationID'
+        . ' JOIN ' . qi('FormationAssignment') . ' otherFa ON otherFa.MembershipNumber = ownFa.MembershipNumber'
+        . ' JOIN ' . qi('TeamFormation') . ' otherTf ON otherTf.FormationID = otherFa.FormationID'
+        . ' JOIN ' . qi('Session') . ' otherS ON otherS.SessionID = otherTf.SessionID'
+        . ' WHERE ownTf.SessionID = :session_id'
+        . ' AND otherTf.SessionID <> :other_session_id'
+        . ' AND DATE(otherS.SessionDateTime) = DATE(:new_datetime_date)'
+        . ' AND ABS(TIMESTAMPDIFF(MINUTE, otherS.SessionDateTime, :new_datetime_diff)) < 180'
+        . ' LIMIT 1'
+    );
+    $stmt->execute([
+        'session_id' => $sessionId,
+        'other_session_id' => $sessionId,
+        'new_datetime_date' => $newDateTime,
+        'new_datetime_diff' => $newDateTime,
+    ]);
+    $conflict = $stmt->fetch();
+    if ($conflict !== false) {
+        throw new RuntimeException(
+            'Changing the session time would conflict with member #'
+            . $conflict['MembershipNumber'] . ' in formation #'
+            . $conflict['FormationID'] . ' at ' . $conflict['SessionDateTime'] . '.'
+        );
+    }
+}
+
+function workflow_assert_assignments_match_team(PDO $pdo, int $formationId, int $teamId): void
+{
+    $teamStmt = $pdo->prepare('SELECT LocationID, Gender FROM ' . qi('Team') . ' WHERE TeamID = :team');
+    $teamStmt->execute(['team' => $teamId]);
+    $team = $teamStmt->fetch();
+    if ($team === false) {
+        throw new RuntimeException('The selected team does not exist.');
+    }
+
+    $requiredGender = (string)$team['Gender'] === 'Boys' ? 'Boy' : 'Girl';
+    $stmt = $pdo->prepare(
+        'SELECT cm.MembershipNumber, cm.Gender, cml.LocationID'
+        . ' FROM ' . qi('FormationAssignment') . ' fa'
+        . ' JOIN ' . qi('ClubMember') . ' cm ON cm.MembershipNumber = fa.MembershipNumber'
+        . ' LEFT JOIN ' . qi('ClubMemberLocation') . ' cml'
+        . ' ON cml.MembershipNumber = cm.MembershipNumber AND cml.EndDate IS NULL'
+        . ' WHERE fa.FormationID = :formation'
+        . ' ORDER BY cml.StartDate DESC'
+    );
+    $stmt->execute(['formation' => $formationId]);
+    foreach ($stmt->fetchAll() as $member) {
+        if ($member['LocationID'] === null || (int)$member['LocationID'] !== (int)$team['LocationID']) {
+            throw new RuntimeException(
+                'Member #' . $member['MembershipNumber']
+                . ' would not belong to the selected team location.'
+            );
+        }
+        if ((string)$member['Gender'] !== $requiredGender) {
+            throw new RuntimeException(
+                'Member #' . $member['MembershipNumber']
+                . ' would not match the selected team gender.'
+            );
+        }
+    }
+}
+
+function workflow_map_session_formations(array $current, array $submitted): array
+{
+    $mapped = [];
+    $usedSubmitted = [];
+
+    foreach ($current as $currentIndex => $currentFormation) {
+        foreach ($submitted as $submittedIndex => $submittedFormation) {
+            if (isset($usedSubmitted[$submittedIndex])) {
+                continue;
+            }
+            if ((int)$submittedFormation['team_id'] === (int)$currentFormation['TeamID']) {
+                $mapped[$currentIndex] = $submittedFormation;
+                $usedSubmitted[$submittedIndex] = true;
+                break;
+            }
+        }
+    }
+
+    foreach ($current as $currentIndex => $currentFormation) {
+        if (isset($mapped[$currentIndex])) {
+            continue;
+        }
+        foreach ($submitted as $submittedIndex => $submittedFormation) {
+            if (!isset($usedSubmitted[$submittedIndex])) {
+                $mapped[$currentIndex] = $submittedFormation;
+                $usedSubmitted[$submittedIndex] = true;
+                break;
+            }
+        }
+    }
+
+    ksort($mapped);
+    $unused = [];
+    foreach ($submitted as $submittedIndex => $submittedFormation) {
+        if (!isset($usedSubmitted[$submittedIndex])) {
+            $unused[] = $submittedFormation;
+        }
+    }
+
+    return [
+        'mapped' => array_values($mapped),
+        'unused' => $unused,
+    ];
+}
+
+function handle_update_session_with_formations(PDO $pdo): void
+{
+    foreach (['Session', 'TeamFormation', 'Team', 'Personnel', 'FormationAssignment', 'ClubMember', 'ClubMemberLocation'] as $table) {
+        assert_real_table($pdo, $table);
+    }
+
+    $sessionId = workflow_required_int($_POST['session_id'] ?? null, 'Session');
+    $input = workflow_session_form_input();
+    $bundle = workflow_session_bundle($pdo, $sessionId);
+    $currentFormations = $bundle['formations'];
+    $mapping = workflow_map_session_formations($currentFormations, $input['formations']);
+    $mapped = $mapping['mapped'];
+    $unused = $mapping['unused'];
+
+    workflow_assert_session_time_has_no_conflicts($pdo, $sessionId, $input['session_datetime']);
+    foreach ($currentFormations as $index => $currentFormation) {
+        workflow_assert_assignments_match_team(
+            $pdo,
+            (int)$currentFormation['FormationID'],
+            (int)$mapped[$index]['team_id']
+        );
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $sessionStmt = $pdo->prepare(
+            'UPDATE ' . qi('Session')
+            . ' SET SessionDateTime = :session_datetime, Address = :address, SessionType = :session_type'
+            . ' WHERE SessionID = :session_id'
+        );
+        $sessionStmt->execute([
+            'session_datetime' => $input['session_datetime'],
+            'address' => $input['address'],
+            'session_type' => $input['session_type'],
+            'session_id' => $sessionId,
+        ]);
+
+        $formationStmt = $pdo->prepare(
+            'UPDATE ' . qi('TeamFormation')
+            . ' SET TeamID = :team_id, HeadCoachID = :coach_id, Score = :score'
+            . ' WHERE FormationID = :formation_id AND SessionID = :session_id'
+        );
+        foreach ($currentFormations as $index => $currentFormation) {
+            $formationStmt->execute([
+                'team_id' => $mapped[$index]['team_id'],
+                'coach_id' => $mapped[$index]['coach_id'],
+                'score' => $mapped[$index]['score'],
+                'formation_id' => $currentFormation['FormationID'],
+                'session_id' => $sessionId,
+            ]);
+        }
+
+        if (count($currentFormations) === 1) {
+            if (count($unused) !== 1) {
+                throw new RuntimeException('Could not determine the missing second team formation.');
+            }
+            $insertFormationStmt = $pdo->prepare(
+                'INSERT INTO ' . qi('TeamFormation')
+                . ' (SessionID, TeamID, HeadCoachID, Score)'
+                . ' VALUES (:session_id, :team_id, :coach_id, :score)'
+            );
+            $insertFormationStmt->execute([
+                'session_id' => $sessionId,
+                'team_id' => $unused[0]['team_id'],
+                'coach_id' => $unused[0]['coach_id'],
+                'score' => $unused[0]['score'],
+            ]);
+        }
+
+        $pdo->commit();
+        flash(
+            'success',
+            count($currentFormations) === 1
+                ? 'Session #' . $sessionId . ' was updated and its missing second formation was added.'
+                : 'Session #' . $sessionId . ' and both formations were updated.'
+        );
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'formations']);
+}
+
+function handle_delete_session_with_formations(PDO $pdo): void
+{
+    $sessionId = workflow_required_int($_POST['session_id'] ?? null, 'Session');
+    $bundle = workflow_session_bundle($pdo, $sessionId);
+    $formationIds = array_map(
+        static fn(array $row): int => (int)$row['FormationID'],
+        $bundle['formations']
+    );
+
+    $pdo->beginTransaction();
+    try {
+        $placeholders = implode(', ', array_fill(0, count($formationIds), '?'));
+        $assignmentStmt = $pdo->prepare(
+            'DELETE FROM ' . qi('FormationAssignment')
+            . ' WHERE FormationID IN (' . $placeholders . ')'
+        );
+        $assignmentStmt->execute($formationIds);
+
+        $formationStmt = $pdo->prepare('DELETE FROM ' . qi('TeamFormation') . ' WHERE SessionID = :session');
+        $formationStmt->execute(['session' => $sessionId]);
+        $sessionStmt = $pdo->prepare('DELETE FROM ' . qi('Session') . ' WHERE SessionID = :session');
+        $sessionStmt->execute(['session' => $sessionId]);
+
+        $pdo->commit();
+        flash('success', 'Session #' . $sessionId . ', its formations, and their assignments were deleted.');
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    redirect_to(['page' => 'formations']);
+}
+
+function handle_assignment_update(PDO $pdo, bool $enforcePayment): void
+{
+    $oldFormationId = workflow_required_int($_POST['old_formation_id'] ?? null, 'Original formation');
+    $oldMembershipNumber = workflow_required_int($_POST['old_membership_number'] ?? null, 'Original club member');
+    $formationId = workflow_required_int($_POST['formation_id'] ?? null, 'Formation');
+    $membershipNumber = workflow_required_int($_POST['membership_number'] ?? null, 'Club member');
+    $role = trim((string)($_POST['role'] ?? ''));
+
+    $existingStmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM ' . qi('FormationAssignment')
+        . ' WHERE FormationID = :formation AND MembershipNumber = :member'
+    );
+    $existingStmt->execute([
+        'formation' => $oldFormationId,
+        'member' => $oldMembershipNumber,
+    ]);
+    if ((int)$existingStmt->fetchColumn() === 0) {
+        throw new RuntimeException('The original assignment was not found.');
+    }
+
+    $roleColumn = table_columns($pdo, 'FormationAssignment')['Role'] ?? null;
+    if (!$roleColumn) {
+        throw new RuntimeException('FormationAssignment.Role is missing.');
+    }
+    $allowedRoles = enum_values((string)$roleColumn['Type']);
+    if ($role === '' || ($allowedRoles !== [] && !in_array($role, $allowedRoles, true))) {
+        throw new InvalidArgumentException('Select a valid formation role.');
+    }
+
+    $validation = validate_assignment(
+        $pdo,
+        $formationId,
+        $membershipNumber,
+        $enforcePayment,
+        $oldFormationId,
+        $oldMembershipNumber
+    );
+
+    $stmt = $pdo->prepare(
+        'UPDATE ' . qi('FormationAssignment')
+        . ' SET FormationID = :formation, MembershipNumber = :member, Role = :role'
+        . ' WHERE FormationID = :old_formation AND MembershipNumber = :old_member'
+    );
+    $stmt->execute([
+        'formation' => $formationId,
+        'member' => $membershipNumber,
+        'role' => $role,
+        'old_formation' => $oldFormationId,
+        'old_member' => $oldMembershipNumber,
+    ]);
+
+    if ($stmt->rowCount() === 0 && ($formationId !== $oldFormationId || $membershipNumber !== $oldMembershipNumber)) {
+        throw new RuntimeException('The original assignment was not found.');
+    }
+
+    $message = 'Formation assignment updated successfully.';
+    if (!$enforcePayment && is_array($validation['payment']) && !$validation['payment']['eligible']) {
+        $message .= ' Payment warning: only $' . number_format($validation['payment']['paid'], 2)
+            . ' of $' . number_format($validation['payment']['required'], 2)
+            . ' is recorded for ' . $validation['payment']['year'] . '.';
+    }
+    flash('success', $message);
+    redirect_to(['page' => 'assignments']);
+}
+
 function assignment_context(PDO $pdo, int $formationId, int $membershipNumber): array
 {
     $formationStmt = $pdo->prepare(
@@ -772,8 +2997,14 @@ function assignment_context(PDO $pdo, int $formationId, int $membershipNumber): 
     return ['formation' => $formation, 'member' => $member];
 }
 
-function validate_assignment(PDO $pdo, int $formationId, int $membershipNumber, bool $enforcePayment): array
-{
+function validate_assignment(
+    PDO $pdo,
+    int $formationId,
+    int $membershipNumber,
+    bool $enforcePayment,
+    ?int $ignoreFormationId = null,
+    ?int $ignoreMembershipNumber = null
+): array {
     foreach (['FormationAssignment', 'TeamFormation', 'Team', 'Session', 'ClubMember', 'ClubMemberLocation'] as $table) {
         assert_real_table($pdo, $table);
     }
@@ -794,24 +3025,30 @@ function validate_assignment(PDO $pdo, int $formationId, int $membershipNumber, 
         throw new RuntimeException('The member gender does not match the selected team.');
     }
 
-    $conflictStmt = $pdo->prepare(
+    $conflictSql =
         'SELECT tf.FormationID, t.TeamName, s.SessionDateTime'
         . ' FROM ' . qi('FormationAssignment') . ' fa'
         . ' JOIN ' . qi('TeamFormation') . ' tf ON tf.FormationID = fa.FormationID'
         . ' JOIN ' . qi('Team') . ' t ON t.TeamID = tf.TeamID'
         . ' JOIN ' . qi('Session') . ' s ON s.SessionID = tf.SessionID'
-        . ' WHERE fa.MembershipNumber = :member'
-        . '   AND tf.FormationID <> :formation'
-        . '   AND DATE(s.SessionDateTime) = DATE(:session_datetime)'
-        . '   AND ABS(TIMESTAMPDIFF(MINUTE, s.SessionDateTime, :session_datetime_again)) < 180'
-        . ' LIMIT 1'
-    );
-    $conflictStmt->execute([
-        'member' => $membershipNumber,
-        'formation' => $formationId,
-        'session_datetime' => $formation['SessionDateTime'],
-        'session_datetime_again' => $formation['SessionDateTime'],
-    ]);
+        . ' WHERE fa.MembershipNumber = :member';
+    $conflictParams = ['member' => $membershipNumber];
+
+    if ($ignoreFormationId !== null && $ignoreMembershipNumber !== null) {
+        $conflictSql .= ' AND NOT (fa.FormationID = :ignore_formation AND fa.MembershipNumber = :ignore_member)';
+        $conflictParams['ignore_formation'] = $ignoreFormationId;
+        $conflictParams['ignore_member'] = $ignoreMembershipNumber;
+    }
+
+    $conflictSql .=
+        ' AND DATE(s.SessionDateTime) = DATE(:session_datetime)'
+        . ' AND ABS(TIMESTAMPDIFF(MINUTE, s.SessionDateTime, :session_datetime_again)) < 180'
+        . ' LIMIT 1';
+    $conflictParams['session_datetime'] = $formation['SessionDateTime'];
+    $conflictParams['session_datetime_again'] = $formation['SessionDateTime'];
+
+    $conflictStmt = $pdo->prepare($conflictSql);
+    $conflictStmt->execute($conflictParams);
     $conflict = $conflictStmt->fetch();
     if ($conflict !== false) {
         throw new RuntimeException(
@@ -1316,11 +3553,62 @@ if (is_post()) {
             case 'crud_delete':
                 handle_crud_delete($db);
                 break;
+            case 'personnel_save':
+                handle_personnel_save($db);
+                break;
+            case 'personnel_delete':
+                handle_personnel_delete($db);
+                break;
+            case 'worksat_save':
+                handle_worksat_save($db);
+                break;
+            case 'worksat_delete':
+                handle_worksat_delete($db);
+                break;
+            case 'family_member_save':
+                handle_family_member_save($db);
+                break;
+            case 'family_member_delete':
+                handle_family_member_delete($db);
+                break;
+            case 'family_location_save':
+                handle_family_location_save($db);
+                break;
+            case 'family_location_delete':
+                handle_family_location_delete($db);
+                break;
+            case 'club_member_save':
+                handle_club_member_save($db);
+                break;
+            case 'club_member_delete':
+                handle_club_member_delete($db);
+                break;
+            case 'club_location_save':
+                handle_club_location_save($db);
+                break;
+            case 'club_location_delete':
+                handle_club_location_delete($db);
+                break;
+            case 'guardianship_save':
+                handle_guardianship_save($db);
+                break;
+            case 'guardianship_delete':
+                handle_guardianship_delete($db);
+                break;
             case 'create_session_formations':
                 handle_create_session_with_formations($db);
                 break;
+            case 'update_session_formations':
+                handle_update_session_with_formations($db);
+                break;
+            case 'delete_session_formations':
+                handle_delete_session_with_formations($db);
+                break;
             case 'assignment_create':
                 handle_assignment_create($db, (bool)$APP['enforce_payment_eligibility_on_assignment']);
+                break;
+            case 'assignment_update':
+                handle_assignment_update($db, (bool)$APP['enforce_payment_eligibility_on_assignment']);
                 break;
             case 'assignment_delete':
                 handle_assignment_delete($db);
@@ -1585,9 +3873,9 @@ function render_page_header(string $title, string $currentPage, ?string $current
         <nav class="nav" aria-label="Primary navigation">
             <?= nav_link('Dashboard', ['page' => 'dashboard'], $currentPage, $currentTable) ?>
             <?= nav_link('Locations', ['page' => 'table', 'table' => 'Location'], $currentPage, $currentTable) ?>
-            <?= nav_link('Personnel', ['page' => 'table', 'table' => 'Personnel'], $currentPage, $currentTable) ?>
-            <?= nav_link('Family Members', ['page' => 'table', 'table' => 'FamilyMember'], $currentPage, $currentTable) ?>
-            <?= nav_link('Club Members', ['page' => 'table', 'table' => 'ClubMember'], $currentPage, $currentTable) ?>
+            <?= nav_link('Personnel', ['page' => 'personnel'], $currentPage, $currentTable) ?>
+            <?= nav_link('Family Members', ['page' => 'family_members'], $currentPage, $currentTable) ?>
+            <?= nav_link('Club Members', ['page' => 'club_members'], $currentPage, $currentTable) ?>
             <?= nav_link('Formations', ['page' => 'formations'], $currentPage, $currentTable) ?>
             <?= nav_link('Assignments', ['page' => 'assignments'], $currentPage, $currentTable) ?>
             <?= nav_link('Payments', ['page' => 'payments'], $currentPage, $currentTable) ?>
@@ -1943,6 +4231,540 @@ function render_table_page(PDO $pdo, string $table, int $limit): void
 <?php
 }
 
+function render_location_history_manager(
+    PDO $pdo,
+    string $page,
+    string $table,
+    string $ownerColumn,
+    string $ownerInputName,
+    int $ownerId,
+    string $ownerLabel,
+    string $saveAction,
+    string $deleteAction
+): void {
+    $editLocation = isset($_GET['edit_location']) ? (int)$_GET['edit_location'] : 0;
+    $editStart = trim((string)($_GET['edit_start'] ?? ''));
+    $editing = $editLocation > 0 && $editStart !== '';
+    $editRow = [];
+
+    if ($editing) {
+        $stmt = $pdo->prepare(
+            'SELECT * FROM ' . qi($table)
+            . ' WHERE ' . qi($ownerColumn) . ' = :owner AND LocationID = :location AND StartDate = :start_date'
+        );
+        $stmt->execute([
+            'owner' => $ownerId,
+            'location' => $editLocation,
+            'start_date' => $editStart,
+        ]);
+        $editRow = $stmt->fetch() ?: [];
+        if ($editRow === []) {
+            throw new RuntimeException('The selected location-history record was not found.');
+        }
+    }
+
+    $locationLabel = workflow_location_label_expression($pdo, 'l');
+    $stmt = $pdo->prepare(
+        'SELECT h.LocationID, h.StartDate, h.EndDate, ' . $locationLabel . ' AS LocationName'
+        . ' FROM ' . qi($table) . ' h'
+        . ' JOIN ' . qi('Location') . ' l ON l.LocationID = h.LocationID'
+        . ' WHERE h.' . qi($ownerColumn) . ' = :owner'
+        . ' ORDER BY h.StartDate DESC, h.LocationID'
+    );
+    $stmt->execute(['owner' => $ownerId]);
+    $history = $stmt->fetchAll();
+    $locations = workflow_location_options($pdo);
+
+    page_heading(
+        $ownerLabel . ' — Location History',
+        'Add, edit, or end location periods without overwriting previous records.',
+        '<a class="button secondary" href="' . e(build_url(['page' => $page])) . '">Back to list</a>'
+    );
+    ?>
+<div class="split">
+<section class="card sticky-card">
+    <h2><?= $editing ? 'Edit location period' : 'Add location period' ?></h2>
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="action" value="<?= e($saveAction) ?>">
+        <input type="hidden" name="return_page" value="<?= e($page) ?>">
+        <input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>">
+        <input type="hidden" name="<?= e($ownerInputName) ?>" value="<?= e($ownerId) ?>">
+        <?php if ($editing): ?>
+            <input type="hidden" name="old_location_id" value="<?= e($editRow['LocationID']) ?>">
+            <input type="hidden" name="old_start_date" value="<?= e($editRow['StartDate']) ?>">
+        <?php endif; ?>
+        <div class="field">
+            <label>Location *</label>
+            <select name="location_id" required>
+                <option value="">— Select —</option>
+                <?php foreach ($locations as $option): ?>
+                    <option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['LocationID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-grid" style="margin-top:13px">
+            <div class="field"><label>Start date *</label><input type="date" name="start_date" value="<?= e($editRow['StartDate'] ?? date('Y-m-d')) ?>" required></div>
+            <div class="field"><label>End date</label><input type="date" name="end_date" value="<?= e($editRow['EndDate'] ?? '') ?>"></div>
+        </div>
+        <div class="toolbar" style="margin-top:17px">
+            <button type="submit"><?= $editing ? 'Save location period' : 'Add location period' ?></button>
+            <?php if ($editing): ?><a class="button secondary" href="<?= e(build_url(['page' => $page, 'mode' => 'locations', 'id' => $ownerId])) ?>">Cancel</a><?php endif; ?>
+        </div>
+    </form>
+</section>
+<section class="card">
+    <h2>Location history</h2>
+    <?php if ($history === []): ?>
+        <div class="empty">No location periods are recorded.</div>
+    <?php else: ?>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Location</th><th>Start date</th><th>End date</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>
+        <?php foreach ($history as $row): ?>
+            <tr>
+                <td><?= e($row['LocationName']) ?> <span class="muted">#<?= e($row['LocationID']) ?></span></td>
+                <td><?= e($row['StartDate']) ?></td>
+                <td><?= format_cell($row['EndDate']) ?></td>
+                <td><span class="badge <?= $row['EndDate'] === null ? 'success' : '' ?>"><?= $row['EndDate'] === null ? 'Current' : 'Ended' ?></span></td>
+                <td class="actions">
+                    <a class="button secondary small-button" href="<?= e(build_url(['page' => $page, 'mode' => 'locations', 'id' => $ownerId, 'edit_location' => $row['LocationID'], 'edit_start' => $row['StartDate']])) ?>">Edit</a>
+                    <form class="inline" method="post" data-confirm="Delete this location-history record?">
+                        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                        <input type="hidden" name="action" value="<?= e($deleteAction) ?>">
+                        <input type="hidden" name="return_page" value="<?= e($page) ?>">
+                        <input type="hidden" name="<?= e($ownerInputName) ?>" value="<?= e($ownerId) ?>">
+                        <input type="hidden" name="location_id" value="<?= e($row['LocationID']) ?>">
+                        <input type="hidden" name="start_date" value="<?= e($row['StartDate']) ?>">
+                        <button class="danger small-button" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table></div>
+    <?php endif; ?>
+</section>
+</div>
+<?php
+}
+
+function render_guardianship_manager(PDO $pdo, string $perspective, int $ownerId, string $ownerLabel): void
+{
+    $familyPerspective = $perspective === 'family';
+    $page = $familyPerspective ? 'family_members' : 'club_members';
+    $mode = $familyPerspective ? 'relationships' : 'guardians';
+    $editFamily = isset($_GET['edit_family']) ? (int)$_GET['edit_family'] : 0;
+    $editMember = isset($_GET['edit_member']) ? (int)$_GET['edit_member'] : 0;
+    $editStart = trim((string)($_GET['edit_start'] ?? ''));
+    $editing = $editFamily > 0 && $editMember > 0 && $editStart !== '';
+    $editRow = [];
+
+    if ($editing) {
+        $stmt = $pdo->prepare(
+            'SELECT * FROM ' . qi('Guardianship')
+            . ' WHERE MembershipNumber = :member AND FamilyMemberID = :family_member AND StartDate = :start_date'
+        );
+        $stmt->execute([
+            'member' => $editMember,
+            'family_member' => $editFamily,
+            'start_date' => $editStart,
+        ]);
+        $editRow = $stmt->fetch() ?: [];
+        if ($editRow === []) {
+            throw new RuntimeException('The selected family relationship was not found.');
+        }
+    }
+
+    if ($familyPerspective) {
+        $stmt = $pdo->prepare(
+            'SELECT g.*, CONCAT(cm.FirstName, \' \', cm.LastName) AS MemberName,'
+            . ' CONCAT(fm.FirstName, \' \', fm.LastName) AS FamilyName'
+            . ' FROM ' . qi('Guardianship') . ' g'
+            . ' JOIN ' . qi('ClubMember') . ' cm ON cm.MembershipNumber = g.MembershipNumber'
+            . ' JOIN ' . qi('FamilyMember') . ' fm ON fm.FamilyMemberID = g.FamilyMemberID'
+            . ' WHERE g.FamilyMemberID = :owner'
+            . ' ORDER BY g.StartDate DESC, cm.LastName, cm.FirstName'
+        );
+        $counterpartOptions = member_options($pdo);
+        $counterpartLabel = 'Club member';
+    } else {
+        $stmt = $pdo->prepare(
+            'SELECT g.*, CONCAT(cm.FirstName, \' \', cm.LastName) AS MemberName,'
+            . ' CONCAT(fm.FirstName, \' \', fm.LastName) AS FamilyName'
+            . ' FROM ' . qi('Guardianship') . ' g'
+            . ' JOIN ' . qi('ClubMember') . ' cm ON cm.MembershipNumber = g.MembershipNumber'
+            . ' JOIN ' . qi('FamilyMember') . ' fm ON fm.FamilyMemberID = g.FamilyMemberID'
+            . ' WHERE g.MembershipNumber = :owner'
+            . ' ORDER BY g.StartDate DESC, fm.LastName, fm.FirstName'
+        );
+        $counterpartOptions = workflow_family_member_options($pdo);
+        $counterpartLabel = 'Family member';
+    }
+    $stmt->execute(['owner' => $ownerId]);
+    $relationships = $stmt->fetchAll();
+    $relationshipTypes = workflow_relationship_values($pdo);
+
+    page_heading(
+        $ownerLabel . ' — Family Relationships',
+        'Manage the related club member, relationship type, and Primary/Secondary status.',
+        '<a class="button secondary" href="' . e(build_url(['page' => $page])) . '">Back to list</a>'
+    );
+    ?>
+<div class="split">
+<section class="card sticky-card">
+    <h2><?= $editing ? 'Edit relationship' : 'Add relationship' ?></h2>
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="action" value="guardianship_save">
+        <input type="hidden" name="return_page" value="<?= e($page) ?>">
+        <input type="hidden" name="relationship_return_page" value="<?= e($page) ?>">
+        <input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>">
+        <?php if ($familyPerspective): ?>
+            <input type="hidden" name="family_member_id" value="<?= e($ownerId) ?>">
+            <div class="field"><label><?= e($counterpartLabel) ?> *</label><select name="membership_number" required><option value="">— Select —</option><?php foreach ($counterpartOptions as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['MembershipNumber'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+        <?php else: ?>
+            <input type="hidden" name="membership_number" value="<?= e($ownerId) ?>">
+            <div class="field"><label><?= e($counterpartLabel) ?> *</label><select name="family_member_id" required><option value="">— Select —</option><?php foreach ($counterpartOptions as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['FamilyMemberID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+        <?php endif; ?>
+        <?php if ($editing): ?>
+            <input type="hidden" name="old_membership_number" value="<?= e($editRow['MembershipNumber']) ?>">
+            <input type="hidden" name="old_family_member_id" value="<?= e($editRow['FamilyMemberID']) ?>">
+            <input type="hidden" name="old_start_date" value="<?= e($editRow['StartDate']) ?>">
+        <?php endif; ?>
+        <div class="form-grid" style="margin-top:13px">
+            <div class="field"><label>Relationship *</label><select name="relationship_type" required><option value="">— Select —</option><?php foreach ($relationshipTypes as $type): ?><option value="<?= e($type) ?>"<?= (string)($editRow['RelationshipType'] ?? '') === $type ? ' selected' : '' ?>><?= e($type) ?></option><?php endforeach; ?></select></div>
+            <div class="field"><label>Designation *</label><select name="is_primary" required><option value="1"<?= (string)($editRow['IsPrimary'] ?? '1') === '1' ? ' selected' : '' ?>>Primary</option><option value="0"<?= (string)($editRow['IsPrimary'] ?? '') === '0' ? ' selected' : '' ?>>Secondary</option></select></div>
+            <div class="field"><label>Start date *</label><input type="date" name="start_date" value="<?= e($editRow['StartDate'] ?? date('Y-m-d')) ?>" required></div>
+            <div class="field"><label>End date</label><input type="date" name="end_date" value="<?= e($editRow['EndDate'] ?? '') ?>"></div>
+        </div>
+        <div class="toolbar" style="margin-top:17px">
+            <button type="submit"><?= $editing ? 'Save relationship' : 'Add relationship' ?></button>
+            <?php if ($editing): ?><a class="button secondary" href="<?= e(build_url(['page' => $page, 'mode' => $mode, 'id' => $ownerId])) ?>">Cancel</a><?php endif; ?>
+        </div>
+    </form>
+</section>
+<section class="card">
+    <h2>Recorded relationships</h2>
+    <?php if ($relationships === []): ?>
+        <div class="empty">No family relationships are recorded.</div>
+    <?php else: ?>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Club member</th><th>Family member</th><th>Relationship</th><th>Designation</th><th>Start</th><th>End</th><th>Actions</th></tr></thead>
+        <tbody>
+        <?php foreach ($relationships as $row): ?>
+            <tr>
+                <td>#<?= e($row['MembershipNumber']) ?> · <?= e($row['MemberName']) ?></td>
+                <td>#<?= e($row['FamilyMemberID']) ?> · <?= e($row['FamilyName']) ?></td>
+                <td><?= e($row['RelationshipType']) ?></td>
+                <td><span class="badge <?= (int)$row['IsPrimary'] === 1 ? 'success' : '' ?>"><?= (int)$row['IsPrimary'] === 1 ? 'Primary' : 'Secondary' ?></span></td>
+                <td><?= e($row['StartDate']) ?></td>
+                <td><?= format_cell($row['EndDate']) ?></td>
+                <td class="actions">
+                    <a class="button secondary small-button" href="<?= e(build_url(['page' => $page, 'mode' => $mode, 'id' => $ownerId, 'edit_family' => $row['FamilyMemberID'], 'edit_member' => $row['MembershipNumber'], 'edit_start' => $row['StartDate']])) ?>">Edit</a>
+                    <form class="inline" method="post" data-confirm="Delete this family relationship?">
+                        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                        <input type="hidden" name="action" value="guardianship_delete">
+                        <input type="hidden" name="return_page" value="<?= e($page) ?>">
+                        <input type="hidden" name="relationship_return_page" value="<?= e($page) ?>">
+                        <input type="hidden" name="family_member_id" value="<?= e($row['FamilyMemberID']) ?>">
+                        <input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>">
+                        <input type="hidden" name="start_date" value="<?= e($row['StartDate']) ?>">
+                        <button class="danger small-button" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table></div>
+    <?php endif; ?>
+</section>
+</div>
+<?php
+}
+
+function render_personnel_page(PDO $pdo): void
+{
+    foreach (['Personnel', 'WorksAt', 'Location', 'Position'] as $table) {
+        if (!table_exists($pdo, $table)) {
+            echo '<div class="notice error">Missing required table: ' . e($table) . '.</div>';
+            return;
+        }
+    }
+
+    $mode = (string)($_GET['mode'] ?? 'list');
+    $personnelId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+
+    if ($mode === 'assignments') {
+        if ($personnelId <= 0) {
+            throw new InvalidArgumentException('Select a personnel record.');
+        }
+        $person = fetch_row_by_pk($pdo, 'Personnel', ['PersonnelID' => $personnelId]);
+        if ($person === null) {
+            throw new RuntimeException('The selected personnel record was not found.');
+        }
+
+        $editLocation = isset($_GET['edit_location']) ? (int)$_GET['edit_location'] : 0;
+        $editStart = trim((string)($_GET['edit_start'] ?? ''));
+        $editing = $editLocation > 0 && $editStart !== '';
+        $editRow = [];
+        if ($editing) {
+            $stmt = $pdo->prepare(
+                'SELECT * FROM ' . qi('WorksAt')
+                . ' WHERE PersonnelID = :personnel AND LocationID = :location AND StartDate = :start_date'
+            );
+            $stmt->execute(['personnel' => $personnelId, 'location' => $editLocation, 'start_date' => $editStart]);
+            $editRow = $stmt->fetch() ?: [];
+            if ($editRow === []) {
+                throw new RuntimeException('The selected assignment was not found.');
+            }
+        }
+
+        $locationLabel = workflow_location_label_expression($pdo, 'l');
+        $stmt = $pdo->prepare(
+            'SELECT wa.*, ' . $locationLabel . ' AS LocationName, pos.PositionName'
+            . ' FROM ' . qi('WorksAt') . ' wa'
+            . ' JOIN ' . qi('Location') . ' l ON l.LocationID = wa.LocationID'
+            . ' JOIN ' . qi('Position') . ' pos ON pos.PositionID = wa.PositionID'
+            . ' WHERE wa.PersonnelID = :personnel'
+            . ' ORDER BY wa.StartDate DESC, wa.LocationID'
+        );
+        $stmt->execute(['personnel' => $personnelId]);
+        $history = $stmt->fetchAll();
+        $locations = workflow_location_options($pdo);
+        $positions = workflow_position_options($pdo);
+        $name = trim((string)$person['FirstName'] . ' ' . (string)$person['LastName']);
+
+        page_heading(
+            $name . ' — Work History',
+            'Maintain the personnel member’s location, position, start date, and end date.',
+            '<a class="button secondary" href="' . e(build_url(['page' => 'personnel'])) . '">Back to personnel</a>'
+        );
+        ?>
+<div class="split">
+<section class="card sticky-card">
+    <h2><?= $editing ? 'Edit assignment' : 'Add assignment' ?></h2>
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="action" value="worksat_save">
+        <input type="hidden" name="return_page" value="personnel">
+        <input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>">
+        <input type="hidden" name="personnel_id" value="<?= e($personnelId) ?>">
+        <?php if ($editing): ?><input type="hidden" name="old_location_id" value="<?= e($editRow['LocationID']) ?>"><input type="hidden" name="old_start_date" value="<?= e($editRow['StartDate']) ?>"><?php endif; ?>
+        <div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['LocationID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+        <div class="field" style="margin-top:13px"><label>Position *</label><select name="position_id" required><option value="">— Select —</option><?php foreach ($positions as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['PositionID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+        <div class="form-grid" style="margin-top:13px"><div class="field"><label>Start date *</label><input type="date" name="start_date" value="<?= e($editRow['StartDate'] ?? date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="end_date" value="<?= e($editRow['EndDate'] ?? '') ?>"></div></div>
+        <div class="toolbar" style="margin-top:17px"><button type="submit"><?= $editing ? 'Save assignment' : 'Add assignment' ?></button><?php if ($editing): ?><a class="button secondary" href="<?= e(build_url(['page' => 'personnel', 'mode' => 'assignments', 'id' => $personnelId])) ?>">Cancel</a><?php endif; ?></div>
+    </form>
+</section>
+<section class="card">
+    <h2>Recorded assignments</h2>
+    <?php if ($history === []): ?><div class="empty">No work assignments are recorded.</div><?php else: ?>
+    <div class="table-wrap"><table><thead><tr><th>Location</th><th>Position</th><th>Start</th><th>End</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+    <?php foreach ($history as $row): ?><tr><td><?= e($row['LocationName']) ?> <span class="muted">#<?= e($row['LocationID']) ?></span></td><td><?= e($row['PositionName']) ?></td><td><?= e($row['StartDate']) ?></td><td><?= format_cell($row['EndDate']) ?></td><td><span class="badge <?= $row['EndDate'] === null ? 'success' : '' ?>"><?= $row['EndDate'] === null ? 'Current' : 'Ended' ?></span></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'personnel', 'mode' => 'assignments', 'id' => $personnelId, 'edit_location' => $row['LocationID'], 'edit_start' => $row['StartDate']])) ?>">Edit</a><form class="inline" method="post" data-confirm="Delete this personnel assignment?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="worksat_delete"><input type="hidden" name="return_page" value="personnel"><input type="hidden" name="personnel_id" value="<?= e($personnelId) ?>"><input type="hidden" name="location_id" value="<?= e($row['LocationID']) ?>"><input type="hidden" name="start_date" value="<?= e($row['StartDate']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?>
+    </tbody></table></div><?php endif; ?>
+</section>
+</div>
+<?php
+        return;
+    }
+
+    if ($mode === 'add' || $mode === 'edit') {
+        $editing = $mode === 'edit';
+        $row = [];
+        if ($editing) {
+            if ($personnelId <= 0) {
+                throw new InvalidArgumentException('Select a personnel record.');
+            }
+            $row = fetch_row_by_pk($pdo, 'Personnel', ['PersonnelID' => $personnelId]) ?? [];
+            if ($row === []) {
+                throw new RuntimeException('The selected personnel record was not found.');
+            }
+        }
+        $locations = workflow_location_options($pdo);
+        $positions = workflow_position_options($pdo);
+        page_heading(
+            $editing ? 'Edit Personnel' : 'Create Personnel',
+            $editing ? 'Update the personnel member’s personal information.' : 'Create the personnel record and its initial work assignment.',
+            '<a class="button secondary" href="' . e(build_url(['page' => 'personnel'])) . '">Back to personnel</a>'
+        );
+        ?>
+<section class="card">
+<form method="post">
+    <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="personnel_save"><input type="hidden" name="return_page" value="personnel"><input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>"><?php if ($editing): ?><input type="hidden" name="personnel_id" value="<?= e($personnelId) ?>"><?php endif; ?>
+    <h2>Personnel information</h2><div class="form-grid"><?php workflow_render_base_fields($pdo, 'Personnel', $row, $editing); ?></div>
+    <?php if (!$editing): ?>
+        <h2 style="margin-top:24px">Initial work assignment</h2>
+        <div class="form-grid"><div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Position *</label><select name="position_id" required><option value="">— Select —</option><?php foreach ($positions as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Start date *</label><input type="date" name="assignment_start_date" value="<?= e(date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="assignment_end_date"></div></div>
+    <?php endif; ?>
+    <div class="toolbar" style="margin-top:18px"><button type="submit"><?= $editing ? 'Save personnel' : 'Create personnel' ?></button><a class="button secondary" href="<?= e(build_url(['page' => 'personnel'])) ?>">Cancel</a></div>
+</form>
+</section>
+<?php
+        return;
+    }
+
+    $locationLabel = workflow_location_label_expression($pdo, 'l');
+    $rows = $pdo->query(
+        'SELECT p.PersonnelID, p.FirstName, p.LastName, p.Email, p.Phone, p.Mandate,'
+        . ' wa.LocationID, wa.StartDate, ' . $locationLabel . ' AS LocationName, pos.PositionName'
+        . ' FROM ' . qi('Personnel') . ' p'
+        . ' LEFT JOIN ' . qi('WorksAt') . ' wa ON wa.PersonnelID = p.PersonnelID'
+        . ' AND wa.EndDate IS NULL'
+        . ' AND wa.StartDate = (SELECT MAX(w2.StartDate) FROM ' . qi('WorksAt') . ' w2 WHERE w2.PersonnelID = p.PersonnelID AND w2.EndDate IS NULL)'
+        . ' LEFT JOIN ' . qi('Location') . ' l ON l.LocationID = wa.LocationID'
+        . ' LEFT JOIN ' . qi('Position') . ' pos ON pos.PositionID = wa.PositionID'
+        . ' ORDER BY p.LastName, p.FirstName, p.PersonnelID LIMIT 250'
+    )->fetchAll();
+
+    page_heading(
+        'Personnel',
+        'Create, edit, delete, and display personnel together with their work-assignment history.',
+        '<a class="button" href="' . e(build_url(['page' => 'personnel', 'mode' => 'add'])) . '">Add Personnel</a>'
+    );
+    ?>
+<section class="card"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Mandate</th><th>Email</th><th>Phone</th><th>Current location</th><th>Current position</th><th>Since</th><th>Actions</th></tr></thead><tbody>
+<?php foreach ($rows as $row): ?><tr><td><?= e($row['PersonnelID']) ?></td><td><?= e($row['FirstName'] . ' ' . $row['LastName']) ?></td><td><?= e($row['Mandate']) ?></td><td><?= e($row['Email']) ?></td><td><?= e($row['Phone']) ?></td><td><?= format_cell($row['LocationName']) ?></td><td><?= format_cell($row['PositionName']) ?></td><td><?= format_cell($row['StartDate']) ?></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'personnel', 'mode' => 'edit', 'id' => $row['PersonnelID']])) ?>">Edit</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'personnel', 'mode' => 'assignments', 'id' => $row['PersonnelID']])) ?>">Work history</a><form class="inline" method="post" data-confirm="Delete this personnel record and its work history?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="personnel_delete"><input type="hidden" name="return_page" value="personnel"><input type="hidden" name="personnel_id" value="<?= e($row['PersonnelID']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?>
+</tbody></table></div></section>
+<?php
+}
+
+function render_family_members_page(PDO $pdo): void
+{
+    foreach (['FamilyMember', 'FamilyMemberLocation', 'Guardianship', 'Location', 'ClubMember'] as $table) {
+        if (!table_exists($pdo, $table)) {
+            echo '<div class="notice error">Missing required table: ' . e($table) . '.</div>';
+            return;
+        }
+    }
+
+    $mode = (string)($_GET['mode'] ?? 'list');
+    $familyMemberId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($mode === 'locations') {
+        $row = fetch_row_by_pk($pdo, 'FamilyMember', ['FamilyMemberID' => $familyMemberId]);
+        if ($row === null) {
+            throw new RuntimeException('The selected family member was not found.');
+        }
+        render_location_history_manager($pdo, 'family_members', 'FamilyMemberLocation', 'FamilyMemberID', 'family_member_id', $familyMemberId, $row['FirstName'] . ' ' . $row['LastName'], 'family_location_save', 'family_location_delete');
+        return;
+    }
+    if ($mode === 'relationships') {
+        $row = fetch_row_by_pk($pdo, 'FamilyMember', ['FamilyMemberID' => $familyMemberId]);
+        if ($row === null) {
+            throw new RuntimeException('The selected family member was not found.');
+        }
+        render_guardianship_manager($pdo, 'family', $familyMemberId, $row['FirstName'] . ' ' . $row['LastName']);
+        return;
+    }
+    if ($mode === 'add' || $mode === 'edit') {
+        $editing = $mode === 'edit';
+        $row = [];
+        if ($editing) {
+            $row = fetch_row_by_pk($pdo, 'FamilyMember', ['FamilyMemberID' => $familyMemberId]) ?? [];
+            if ($row === []) {
+                throw new RuntimeException('The selected family member was not found.');
+            }
+        }
+        $locations = workflow_location_options($pdo);
+        $members = member_options($pdo);
+        $relationships = workflow_relationship_values($pdo);
+        page_heading($editing ? 'Edit Family Member' : 'Create Family Member', $editing ? 'Update the family member’s personal information.' : 'Create the family member, initial location, and an optional child relationship.', '<a class="button secondary" href="' . e(build_url(['page' => 'family_members'])) . '">Back to family members</a>');
+        ?>
+<section class="card"><form method="post"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="family_member_save"><input type="hidden" name="return_page" value="family_members"><input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>"><?php if ($editing): ?><input type="hidden" name="family_member_id" value="<?= e($familyMemberId) ?>"><?php endif; ?><h2>Family-member information</h2><div class="form-grid"><?php workflow_render_base_fields($pdo, 'FamilyMember', $row, $editing); ?></div>
+<?php if (!$editing): ?><h2 style="margin-top:24px">Initial location</h2><div class="form-grid"><div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Start date *</label><input type="date" name="location_start_date" value="<?= e(date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="location_end_date"></div></div><h2 style="margin-top:24px">Initial child relationship <span class="muted small">(optional)</span></h2><div class="form-grid"><div class="field"><label>Club member</label><select name="membership_number"><option value="">— None —</option><?php foreach ($members as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Relationship</label><select name="relationship_type"><option value="">— Select —</option><?php foreach ($relationships as $type): ?><option value="<?= e($type) ?>"><?= e($type) ?></option><?php endforeach; ?></select></div><div class="field"><label>Designation</label><select name="is_primary"><option value="1">Primary</option><option value="0">Secondary</option></select></div><div class="field"><label>Relationship start date</label><input type="date" name="relationship_start_date" value="<?= e(date('Y-m-d')) ?>"></div><div class="field"><label>Relationship end date</label><input type="date" name="relationship_end_date"></div></div><?php endif; ?><div class="toolbar" style="margin-top:18px"><button type="submit"><?= $editing ? 'Save family member' : 'Create family member' ?></button><a class="button secondary" href="<?= e(build_url(['page' => 'family_members'])) ?>">Cancel</a></div></form></section>
+<?php
+        return;
+    }
+
+    $locationLabel = workflow_location_label_expression($pdo, 'l');
+    $rows = $pdo->query(
+        'SELECT fm.FamilyMemberID, fm.FirstName, fm.LastName, fm.Email, fm.Phone,'
+        . ' fml.LocationID, ' . $locationLabel . ' AS LocationName,'
+        . ' (SELECT COUNT(DISTINCT g.MembershipNumber) FROM ' . qi('Guardianship') . ' g'
+        . ' WHERE g.FamilyMemberID = fm.FamilyMemberID'
+        . ' AND g.StartDate <= CURDATE() AND (g.EndDate IS NULL OR g.EndDate >= CURDATE())) AS ActiveChildren'
+        . ' FROM ' . qi('FamilyMember') . ' fm'
+        . ' LEFT JOIN ' . qi('FamilyMemberLocation') . ' fml ON fml.FamilyMemberID = fm.FamilyMemberID'
+        . ' AND fml.EndDate IS NULL'
+        . ' AND fml.StartDate = (SELECT MAX(f2.StartDate) FROM ' . qi('FamilyMemberLocation') . ' f2 WHERE f2.FamilyMemberID = fm.FamilyMemberID AND f2.EndDate IS NULL)'
+        . ' LEFT JOIN ' . qi('Location') . ' l ON l.LocationID = fml.LocationID'
+        . ' ORDER BY fm.LastName, fm.FirstName, fm.FamilyMemberID LIMIT 250'
+    )->fetchAll();
+    page_heading('Family Members', 'Create, edit, delete, and display family members with location history and Primary/Secondary child relationships.', '<a class="button" href="' . e(build_url(['page' => 'family_members', 'mode' => 'add'])) . '">Add Family Member</a>');
+    ?>
+<section class="card"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Current location</th><th>Active children</th><th>Actions</th></tr></thead><tbody><?php foreach ($rows as $row): ?><tr><td><?= e($row['FamilyMemberID']) ?></td><td><?= e($row['FirstName'] . ' ' . $row['LastName']) ?></td><td><?= e($row['Email']) ?></td><td><?= e($row['Phone']) ?></td><td><?= format_cell($row['LocationName']) ?></td><td><?= e($row['ActiveChildren']) ?></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'family_members', 'mode' => 'edit', 'id' => $row['FamilyMemberID']])) ?>">Edit</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'family_members', 'mode' => 'locations', 'id' => $row['FamilyMemberID']])) ?>">Locations</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'family_members', 'mode' => 'relationships', 'id' => $row['FamilyMemberID']])) ?>">Relationships</a><form class="inline" method="post" data-confirm="Delete this family member, location history, and relationships?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="family_member_delete"><input type="hidden" name="return_page" value="family_members"><input type="hidden" name="family_member_id" value="<?= e($row['FamilyMemberID']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?></tbody></table></div></section>
+<?php
+}
+
+function render_club_members_page(PDO $pdo): void
+{
+    foreach (['ClubMember', 'ClubMemberLocation', 'Guardianship', 'Location', 'FamilyMember'] as $table) {
+        if (!table_exists($pdo, $table)) {
+            echo '<div class="notice error">Missing required table: ' . e($table) . '.</div>';
+            return;
+        }
+    }
+
+    $mode = (string)($_GET['mode'] ?? 'list');
+    $membershipNumber = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($mode === 'locations') {
+        $row = fetch_row_by_pk($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber]);
+        if ($row === null) {
+            throw new RuntimeException('The selected club member was not found.');
+        }
+        render_location_history_manager($pdo, 'club_members', 'ClubMemberLocation', 'MembershipNumber', 'membership_number', $membershipNumber, $row['FirstName'] . ' ' . $row['LastName'], 'club_location_save', 'club_location_delete');
+        return;
+    }
+    if ($mode === 'guardians') {
+        $row = fetch_row_by_pk($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber]);
+        if ($row === null) {
+            throw new RuntimeException('The selected club member was not found.');
+        }
+        render_guardianship_manager($pdo, 'club', $membershipNumber, $row['FirstName'] . ' ' . $row['LastName']);
+        return;
+    }
+    if ($mode === 'add' || $mode === 'edit') {
+        $editing = $mode === 'edit';
+        $row = [];
+        if ($editing) {
+            $row = fetch_row_by_pk($pdo, 'ClubMember', ['MembershipNumber' => $membershipNumber]) ?? [];
+            if ($row === []) {
+                throw new RuntimeException('The selected club member was not found.');
+            }
+        }
+        $locations = workflow_location_options($pdo);
+        $familyMembers = workflow_family_member_options($pdo);
+        $relationships = workflow_relationship_values($pdo);
+        page_heading($editing ? 'Edit Club Member' : 'Create Club Member', $editing ? 'Update the club member’s personal information.' : 'Create the member, initial location, and required family relationship for a minor.', '<a class="button secondary" href="' . e(build_url(['page' => 'club_members'])) . '">Back to club members</a>');
+        ?>
+<section class="card"><form method="post"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="club_member_save"><input type="hidden" name="return_page" value="club_members"><input type="hidden" name="mode" value="<?= $editing ? 'update' : 'insert' ?>"><?php if ($editing): ?><input type="hidden" name="membership_number" value="<?= e($membershipNumber) ?>"><?php endif; ?><h2>Club-member information</h2><div class="form-grid"><?php workflow_render_base_fields($pdo, 'ClubMember', $row, $editing); ?></div>
+<?php if (!$editing): ?><h2 style="margin-top:24px">Initial location</h2><div class="form-grid"><div class="field"><label>Location *</label><select name="location_id" required><option value="">— Select —</option><?php foreach ($locations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Start date *</label><input type="date" name="location_start_date" value="<?= e(date('Y-m-d')) ?>" required></div><div class="field"><label>End date</label><input type="date" name="location_end_date"></div></div><h2 style="margin-top:24px">Family relationship</h2><p class="muted small">A family member is required when the date of birth makes the new member a minor.</p><div class="form-grid"><div class="field"><label>Family member</label><select name="family_member_id"><option value="">— None for a major member —</option><?php foreach ($familyMembers as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div><div class="field"><label>Relationship</label><select name="relationship_type"><option value="">— Select —</option><?php foreach ($relationships as $type): ?><option value="<?= e($type) ?>"><?= e($type) ?></option><?php endforeach; ?></select></div><div class="field"><label>Designation</label><select name="is_primary"><option value="1">Primary</option><option value="0">Secondary</option></select></div><div class="field"><label>Relationship start date</label><input type="date" name="relationship_start_date" value="<?= e(date('Y-m-d')) ?>"></div><div class="field"><label>Relationship end date</label><input type="date" name="relationship_end_date"></div></div><?php endif; ?><div class="toolbar" style="margin-top:18px"><button type="submit"><?= $editing ? 'Save club member' : 'Create club member' ?></button><a class="button secondary" href="<?= e(build_url(['page' => 'club_members'])) ?>">Cancel</a></div></form></section>
+<?php
+        return;
+    }
+
+    $locationLabel = workflow_location_label_expression($pdo, 'l');
+    $rows = $pdo->query(
+        'SELECT cm.MembershipNumber, cm.FirstName, cm.LastName, cm.DOB, cm.Gender, cm.Email, cm.Phone,'
+        . ' cml.LocationID, ' . $locationLabel . ' AS LocationName,'
+        . ' (SELECT GROUP_CONCAT(DISTINCT CONCAT(fm2.FirstName, \' \', fm2.LastName) ORDER BY fm2.LastName SEPARATOR \', \')'
+        . ' FROM ' . qi('Guardianship') . ' g2'
+        . ' JOIN ' . qi('FamilyMember') . ' fm2 ON fm2.FamilyMemberID = g2.FamilyMemberID'
+        . ' WHERE g2.MembershipNumber = cm.MembershipNumber AND g2.IsPrimary = 1'
+        . ' AND g2.StartDate <= CURDATE() AND (g2.EndDate IS NULL OR g2.EndDate >= CURDATE())) AS PrimaryGuardian'
+        . ' FROM ' . qi('ClubMember') . ' cm'
+        . ' LEFT JOIN ' . qi('ClubMemberLocation') . ' cml ON cml.MembershipNumber = cm.MembershipNumber'
+        . ' AND cml.EndDate IS NULL'
+        . ' AND cml.StartDate = (SELECT MAX(c2.StartDate) FROM ' . qi('ClubMemberLocation') . ' c2 WHERE c2.MembershipNumber = cm.MembershipNumber AND c2.EndDate IS NULL)'
+        . ' LEFT JOIN ' . qi('Location') . ' l ON l.LocationID = cml.LocationID'
+        . ' ORDER BY cm.LastName, cm.FirstName, cm.MembershipNumber LIMIT 250'
+    )->fetchAll();
+    page_heading('Club Members', 'Create, edit, delete, and display major/minor members with location history and family relationships.', '<a class="button" href="' . e(build_url(['page' => 'club_members', 'mode' => 'add'])) . '">Add Club Member</a>');
+    ?>
+<section class="card"><div class="table-wrap"><table><thead><tr><th>Membership</th><th>Name</th><th>Type</th><th>Date of birth</th><th>Gender</th><th>Email</th><th>Current location</th><th>Primary guardian</th><th>Actions</th></tr></thead><tbody><?php foreach ($rows as $row): $age = age_on_date((string)$row['DOB'], date('Y-m-d')); ?><tr><td><?= e($row['MembershipNumber']) ?></td><td><?= e($row['FirstName'] . ' ' . $row['LastName']) ?></td><td><span class="badge <?= $age < 18 ? 'warning' : 'success' ?>"><?= $age < 18 ? 'Minor' : 'Major' ?></span></td><td><?= e($row['DOB']) ?></td><td><?= e($row['Gender']) ?></td><td><?= e($row['Email']) ?></td><td><?= format_cell($row['LocationName']) ?></td><td><?= format_cell($row['PrimaryGuardian']) ?></td><td class="actions"><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'edit', 'id' => $row['MembershipNumber']])) ?>">Edit</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'locations', 'id' => $row['MembershipNumber']])) ?>">Locations</a><a class="button secondary small-button" href="<?= e(build_url(['page' => 'club_members', 'mode' => 'guardians', 'id' => $row['MembershipNumber']])) ?>">Family</a><form class="inline" method="post" data-confirm="Delete this club member, location history, and family relationships?"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="club_member_delete"><input type="hidden" name="return_page" value="club_members"><input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>"><button class="danger small-button" type="submit">Delete</button></form></td></tr><?php endforeach; ?></tbody></table></div></section>
+<?php
+}
+
 function team_options(PDO $pdo): array
 {
     if (!table_exists($pdo, 'Team')) {
@@ -2004,7 +4826,7 @@ function render_formations_page(PDO $pdo): void
 {
     page_heading(
         'Sessions and Team Formations',
-        'Create one game/training session together with its two team formations, or use the schema-driven screens for detailed edits.'
+        'Create, edit, delete, and display a complete game/training session with its two team formations.'
     );
 
     $required = ['Session', 'TeamFormation', 'Team', 'Personnel', 'FormationAssignment'];
@@ -2017,6 +4839,18 @@ function render_formations_page(PDO $pdo): void
 
     $teams = team_options($pdo);
     $coaches = personnel_options($pdo);
+    $editSessionId = isset($_GET['edit_session']) ? (int)$_GET['edit_session'] : 0;
+    $editing = $editSessionId > 0;
+    $sessionValue = [];
+    $formationValues = [[], []];
+    if ($editing) {
+        $bundle = workflow_session_bundle($pdo, $editSessionId);
+        $sessionValue = $bundle['session'];
+        foreach (array_values($bundle['formations']) as $index => $formationValue) {
+            $formationValues[$index] = $formationValue;
+        }
+    }
+
     $formations = $pdo->query(
         'SELECT tf.FormationID, s.SessionID, s.SessionDateTime, s.SessionType, s.Address,'
         . ' t.TeamName, t.Gender, tf.Score,'
@@ -2033,48 +4867,54 @@ function render_formations_page(PDO $pdo): void
     ?>
 <div class="split">
 <section class="card sticky-card">
-    <h2>Create a complete session</h2>
-    <p class="muted small">The transaction inserts one <code>Session</code> row and exactly two <code>TeamFormation</code> rows.</p>
+    <div class="card-header">
+        <div><h2><?= $editing ? 'Edit session #' . e($editSessionId) : 'Create a complete session' ?></h2><div class="muted small">The workflow saves one <code>Session</code> and exactly two <code>TeamFormation</code> records.</div></div>
+        <?php if ($editing): ?><a class="button secondary" href="<?= e(build_url(['page' => 'formations'])) ?>">Cancel</a><?php endif; ?>
+    </div>
+    <?php if ($editing && count($bundle['formations']) === 1): ?>
+        <div class="notice warning">This session currently has one team formation. Saving it will add the required second formation.</div>
+    <?php endif; ?>
     <form method="post">
         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
-        <input type="hidden" name="action" value="create_session_formations">
+        <input type="hidden" name="action" value="<?= $editing ? 'update_session_formations' : 'create_session_formations' ?>">
         <input type="hidden" name="return_page" value="formations">
+        <?php if ($editing): ?><input type="hidden" name="session_id" value="<?= e($editSessionId) ?>"><?php endif; ?>
         <div class="form-grid">
             <div class="field full">
                 <label for="session_datetime">Session date and time *</label>
-                <input id="session_datetime" type="datetime-local" name="session_datetime" required>
+                <input id="session_datetime" type="datetime-local" name="session_datetime" value="<?= e(isset($sessionValue['SessionDateTime']) ? str_replace(' ', 'T', substr((string)$sessionValue['SessionDateTime'], 0, 16)) : '') ?>" required>
             </div>
             <div class="field full">
                 <label for="address">Address *</label>
-                <input id="address" name="address" maxlength="150" required>
+                <input id="address" name="address" maxlength="150" value="<?= e($sessionValue['Address'] ?? '') ?>" required>
             </div>
             <div class="field full">
                 <label for="session_type">Nature *</label>
                 <select id="session_type" name="session_type" required>
-                    <option value="Training">Training</option>
-                    <option value="Game">Game</option>
+                    <option value="Training"<?= (string)($sessionValue['SessionType'] ?? 'Training') === 'Training' ? ' selected' : '' ?>>Training</option>
+                    <option value="Game"<?= (string)($sessionValue['SessionType'] ?? '') === 'Game' ? ' selected' : '' ?>>Game</option>
                 </select>
             </div>
         </div>
         <h3 style="margin-top:20px">Team 1</h3>
         <div class="form-grid">
-            <div class="field full"><label>Team *</label><select name="team_1" required><option value="">— Select —</option><?php foreach ($teams as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
-            <div class="field"><label>Head coach *</label><select name="coach_1" required><option value="">— Select —</option><?php foreach ($coaches as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
-            <div class="field"><label>Score</label><input type="number" min="0" step="1" name="score_1"><span class="hint">Ignored for training sessions.</span></div>
+            <div class="field full"><label>Team *</label><select name="team_1" required><option value="">— Select —</option><?php foreach ($teams as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($formationValues[0]['TeamID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+            <div class="field"><label>Head coach *</label><select name="coach_1" required><option value="">— Select —</option><?php foreach ($coaches as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($formationValues[0]['HeadCoachID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+            <div class="field"><label>Score</label><input type="number" min="0" step="1" name="score_1" value="<?= e($formationValues[0]['Score'] ?? '') ?>"><span class="hint">Ignored for training sessions.</span></div>
         </div>
         <h3 style="margin-top:20px">Team 2</h3>
         <div class="form-grid">
-            <div class="field full"><label>Team *</label><select name="team_2" required><option value="">— Select —</option><?php foreach ($teams as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
-            <div class="field"><label>Head coach *</label><select name="coach_2" required><option value="">— Select —</option><?php foreach ($coaches as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
-            <div class="field"><label>Score</label><input type="number" min="0" step="1" name="score_2"><span class="hint">Ignored for training sessions.</span></div>
+            <div class="field full"><label>Team *</label><select name="team_2" required><option value="">— Select —</option><?php foreach ($teams as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($formationValues[1]['TeamID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+            <div class="field"><label>Head coach *</label><select name="coach_2" required><option value="">— Select —</option><?php foreach ($coaches as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($formationValues[1]['HeadCoachID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select></div>
+            <div class="field"><label>Score</label><input type="number" min="0" step="1" name="score_2" value="<?= e($formationValues[1]['Score'] ?? '') ?>"><span class="hint">Ignored for training sessions.</span></div>
         </div>
-        <button style="margin-top:18px" type="submit">Create session and formations</button>
+        <button style="margin-top:18px" type="submit"><?= $editing ? 'Save session and formations' : 'Create session and formations' ?></button>
     </form>
 </section>
 
 <section class="card">
     <div class="card-header">
-        <div><h2>Existing formations</h2><div class="muted small">Latest 150 rows, with player counts.</div></div>
+        <div><h2>Existing formations</h2><div class="muted small">Latest 150 rows, with player counts. Edit or delete acts on the complete two-team session.</div></div>
         <div class="toolbar">
             <a class="button secondary" href="<?= e(build_url(['page' => 'table', 'table' => 'Session'])) ?>">Manage sessions</a>
             <a class="button secondary" href="<?= e(build_url(['page' => 'table', 'table' => 'TeamFormation'])) ?>">Manage formations</a>
@@ -2083,9 +4923,11 @@ function render_formations_page(PDO $pdo): void
     </div>
     <div class="table-wrap">
         <table>
-            <thead><tr><th>Formation</th><th>Session</th><th>Date/time</th><th>Type</th><th>Team</th><th>Gender</th><th>Coach</th><th>Score</th><th>Players</th><th>Address</th></tr></thead>
+            <thead><tr><th>Formation</th><th>Session</th><th>Date/time</th><th>Type</th><th>Team</th><th>Gender</th><th>Coach</th><th>Score</th><th>Players</th><th>Address</th><th>Session actions</th></tr></thead>
             <tbody>
+            <?php $shownSessionActions = []; ?>
             <?php foreach ($formations as $row): ?>
+                <?php $showActions = !isset($shownSessionActions[(int)$row['SessionID']]); $shownSessionActions[(int)$row['SessionID']] = true; ?>
                 <tr>
                     <td><?= e($row['FormationID']) ?></td>
                     <td><?= e($row['SessionID']) ?></td>
@@ -2097,6 +4939,20 @@ function render_formations_page(PDO $pdo): void
                     <td><?= format_cell($row['Score']) ?></td>
                     <td><?= e($row['PlayerCount']) ?></td>
                     <td><?= e($row['Address']) ?></td>
+                    <td class="actions">
+                        <?php if ($showActions): ?>
+                            <a class="button secondary small-button" href="<?= e(build_url(['page' => 'formations', 'edit_session' => $row['SessionID']])) ?>">Edit</a>
+                            <form class="inline" method="post" data-confirm="Delete this session, both formations, and all of their player assignments?">
+                                <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                                <input type="hidden" name="action" value="delete_session_formations">
+                                <input type="hidden" name="return_page" value="formations">
+                                <input type="hidden" name="session_id" value="<?= e($row['SessionID']) ?>">
+                                <button class="danger small-button" type="submit">Delete</button>
+                            </form>
+                        <?php else: ?>
+                            <span class="muted">Same session</span>
+                        <?php endif; ?>
+                    </td>
                 </tr>
             <?php endforeach; ?>
             </tbody>
@@ -2111,7 +4967,7 @@ function render_assignments_page(PDO $pdo, bool $enforcePayment): void
 {
     page_heading(
         'Formation Assignments',
-        'Assign club members to formations. The GUI validates current location, team gender, and the three-hour same-day rule before insertion.'
+        'Assign, edit, and delete club-member formation assignments. The GUI validates location, team gender, and the three-hour same-day rule.'
     );
 
     foreach (['FormationAssignment', 'TeamFormation', 'Team', 'Session', 'ClubMember', 'ClubMemberLocation'] as $table) {
@@ -2124,6 +4980,22 @@ function render_assignments_page(PDO $pdo, bool $enforcePayment): void
     $formations = formation_options($pdo);
     $members = member_options($pdo);
     $roles = enum_values((string)(table_columns($pdo, 'FormationAssignment')['Role']['Type'] ?? ''));
+    $editFormationId = isset($_GET['edit_formation']) ? (int)$_GET['edit_formation'] : 0;
+    $editMembershipNumber = isset($_GET['edit_member']) ? (int)$_GET['edit_member'] : 0;
+    $editing = $editFormationId > 0 && $editMembershipNumber > 0;
+    $editRow = [];
+    if ($editing) {
+        $stmt = $pdo->prepare(
+            'SELECT FormationID, MembershipNumber, Role FROM ' . qi('FormationAssignment')
+            . ' WHERE FormationID = :formation AND MembershipNumber = :member'
+        );
+        $stmt->execute(['formation' => $editFormationId, 'member' => $editMembershipNumber]);
+        $editRow = $stmt->fetch() ?: [];
+        if ($editRow === []) {
+            throw new RuntimeException('The selected formation assignment was not found.');
+        }
+    }
+
     $assignments = $pdo->query(
         'SELECT fa.FormationID, fa.MembershipNumber, fa.Role,'
         . " CONCAT(cm.FirstName, ' ', cm.LastName) AS MemberName, cm.Gender,"
@@ -2141,24 +5013,25 @@ function render_assignments_page(PDO $pdo, bool $enforcePayment): void
 <?php endif; ?>
 <div class="split">
 <section class="card sticky-card">
-    <h2>Assign club member</h2>
+    <div class="card-header"><h2><?= $editing ? 'Edit assignment' : 'Assign club member' ?></h2><?php if ($editing): ?><a class="button secondary" href="<?= e(build_url(['page' => 'assignments'])) ?>">Cancel</a><?php endif; ?></div>
     <form method="post">
         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
-        <input type="hidden" name="action" value="assignment_create">
+        <input type="hidden" name="action" value="<?= $editing ? 'assignment_update' : 'assignment_create' ?>">
         <input type="hidden" name="return_page" value="assignments">
+        <?php if ($editing): ?><input type="hidden" name="old_formation_id" value="<?= e($editRow['FormationID']) ?>"><input type="hidden" name="old_membership_number" value="<?= e($editRow['MembershipNumber']) ?>"><?php endif; ?>
         <div class="field">
             <label>Formation *</label>
-            <select name="formation_id" required><option value="">— Select —</option><?php foreach ($formations as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select>
+            <select name="formation_id" required><option value="">— Select —</option><?php foreach ($formations as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['FormationID'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select>
         </div>
         <div class="field" style="margin-top:13px">
             <label>Club member *</label>
-            <select name="membership_number" required><option value="">— Select —</option><?php foreach ($members as $option): ?><option value="<?= e($option['option_value']) ?>"><?= e($option['option_label']) ?></option><?php endforeach; ?></select>
+            <select name="membership_number" required><option value="">— Select —</option><?php foreach ($members as $option): ?><option value="<?= e($option['option_value']) ?>"<?= (string)($editRow['MembershipNumber'] ?? '') === (string)$option['option_value'] ? ' selected' : '' ?>><?= e($option['option_label']) ?></option><?php endforeach; ?></select>
         </div>
         <div class="field" style="margin-top:13px">
             <label>Role *</label>
-            <select name="role" required><option value="">— Select —</option><?php foreach ($roles as $role): ?><option value="<?= e($role) ?>"><?= e($role) ?></option><?php endforeach; ?></select>
+            <select name="role" required><option value="">— Select —</option><?php foreach ($roles as $role): ?><option value="<?= e($role) ?>"<?= (string)($editRow['Role'] ?? '') === $role ? ' selected' : '' ?>><?= e($role) ?></option><?php endforeach; ?></select>
         </div>
-        <button style="margin-top:17px" type="submit">Assign member</button>
+        <button style="margin-top:17px" type="submit"><?= $editing ? 'Save assignment' : 'Assign member' ?></button>
     </form>
     <hr style="border:0;border-top:1px solid var(--border);margin:22px 0">
     <a class="button secondary" href="<?= e(build_url(['page' => 'integrity'])) ?>">Install/test conflict trigger</a>
@@ -2166,17 +5039,20 @@ function render_assignments_page(PDO $pdo, bool $enforcePayment): void
 <section class="card">
     <div class="card-header"><div><h2>Current assignments</h2><div class="muted small">Latest 250 assignments.</div></div><a class="button secondary" href="<?= e(build_url(['page' => 'table', 'table' => 'FormationAssignment'])) ?>">Raw table editor</a></div>
     <div class="table-wrap"><table>
-        <thead><tr><th>Date/time</th><th>Team</th><th>Type</th><th>Member</th><th>Gender</th><th>Role</th><th>Action</th></tr></thead>
+        <thead><tr><th>Date/time</th><th>Team</th><th>Type</th><th>Member</th><th>Gender</th><th>Role</th><th>Actions</th></tr></thead>
         <tbody>
         <?php foreach ($assignments as $row): ?>
             <tr>
                 <td><?= e($row['SessionDateTime']) ?></td><td><?= e($row['TeamName']) ?></td><td><?= e($row['SessionType']) ?></td>
                 <td>#<?= e($row['MembershipNumber']) ?> · <?= e($row['MemberName']) ?></td><td><?= e($row['Gender']) ?></td><td><?= e($row['Role']) ?></td>
-                <td><form method="post" data-confirm="Delete this formation assignment?">
-                    <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="assignment_delete"><input type="hidden" name="return_page" value="assignments">
-                    <input type="hidden" name="formation_id" value="<?= e($row['FormationID']) ?>"><input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>">
-                    <button class="danger small-button" type="submit">Delete</button>
-                </form></td>
+                <td class="actions">
+                    <a class="button secondary small-button" href="<?= e(build_url(['page' => 'assignments', 'edit_formation' => $row['FormationID'], 'edit_member' => $row['MembershipNumber']])) ?>">Edit</a>
+                    <form class="inline" method="post" data-confirm="Delete this formation assignment?">
+                        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="assignment_delete"><input type="hidden" name="return_page" value="assignments">
+                        <input type="hidden" name="formation_id" value="<?= e($row['FormationID']) ?>"><input type="hidden" name="membership_number" value="<?= e($row['MembershipNumber']) ?>">
+                        <button class="danger small-button" type="submit">Delete</button>
+                    </form>
+                </td>
             </tr>
         <?php endforeach; ?>
         </tbody>
@@ -2322,7 +5198,7 @@ function render_emails_page(PDO $pdo): void
 {
     page_heading(
         'Email Generation and Logs',
-        'Generate the required schedule-email content for assigned members and store sender, receiver, subject, and the first 100 body characters in EmailLog.'
+	''
     );
     foreach (['EmailLog', 'FormationAssignment', 'TeamFormation', 'Session', 'Team', 'Location', 'Personnel', 'ClubMember'] as $table) {
         if (!table_exists($pdo, $table)) {
@@ -2680,6 +5556,9 @@ $currentTable = $page === 'table' ? (string)($_GET['table'] ?? '') : null;
 $titleMap = [
     'dashboard' => 'Dashboard',
     'table' => $currentTable ? humanize($currentTable) : 'Table',
+    'personnel' => 'Personnel',
+    'family_members' => 'Family Members',
+    'club_members' => 'Club Members',
     'formations' => 'Sessions and Team Formations',
     'assignments' => 'Formation Assignments',
     'payments' => 'Payments',
@@ -2707,6 +5586,15 @@ try {
         case 'table':
             $table = (string)($_GET['table'] ?? '');
             render_table_page($pdo, $table, (int)$APP['rows_per_table']);
+            break;
+        case 'personnel':
+            render_personnel_page($pdo);
+            break;
+        case 'family_members':
+            render_family_members_page($pdo);
+            break;
+        case 'club_members':
+            render_club_members_page($pdo);
             break;
         case 'formations':
             render_formations_page($pdo);

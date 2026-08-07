@@ -3729,16 +3729,10 @@ function handle_generate_emails(PDO $pdo): void
         assert_real_table($pdo, $table);
     }
 
-    $startDate = trim((string)($_POST['start_date'] ?? ''));
-    $endDate = trim((string)($_POST['end_date'] ?? ''));
+    $period = sunday_notice_period();
+    $startDate = $period['start'];
+    $endDate = $period['end'];
     $skipDuplicates = isset($_POST['skip_duplicates']);
-
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
-        throw new InvalidArgumentException('Enter valid start and end dates.');
-    }
-    if ($endDate < $startDate) {
-        throw new InvalidArgumentException('The end date cannot be before the start date.');
-    }
 
     $locationNameColumn = first_existing_column($pdo, 'Location', ['LocationName', 'Name']);
     $locationExpression = $locationNameColumn
@@ -3760,6 +3754,7 @@ function handle_generate_emails(PDO $pdo): void
         . ' JOIN ' . qi('Personnel') . ' p ON p.PersonnelID = tf.HeadCoachID'
         . ' JOIN ' . qi('Location') . ' l ON l.LocationID = t.LocationID'
         . ' WHERE s.SessionDateTime >= :start_datetime'
+        . '   AND s.SessionDateTime >= NOW()'
         . '   AND s.SessionDateTime < DATE_ADD(:end_date, INTERVAL 1 DAY)'
         . ' ORDER BY s.SessionDateTime, t.TeamName, cm.LastName, cm.FirstName';
 
@@ -3769,6 +3764,16 @@ function handle_generate_emails(PDO $pdo): void
         'end_date' => $endDate,
     ]);
     $scheduled = $stmt->fetchAll();
+
+    if ($scheduled === []) {
+        $_SESSION['generated_email_preview'] = [];
+        flash(
+            'warning',
+            'No assigned players were found for future sessions in the Sunday notice period '
+            . $period['start_label'] . ' through ' . $period['end_label'] . '.'
+        );
+        redirect_to(['page' => 'emails']);
+    }
 
     $duplicateStmt = $pdo->prepare(
         'SELECT COUNT(*) FROM ' . qi('EmailLog')
@@ -3843,11 +3848,13 @@ function handle_generate_emails(PDO $pdo): void
     }
 
     $_SESSION['generated_email_preview'] = $generated;
-    flash(
-        'success',
-        $inserted . ' email log entr' . ($inserted === 1 ? 'y was' : 'ies were')
-        . ' generated. ' . $skipped . ' probable duplicate(s) were skipped. No SMTP message was sent.'
-    );
+
+    $message = $inserted . ' session notice log entr' . ($inserted === 1 ? 'y was' : 'ies were')
+        . ' generated for ' . $period['start_label'] . ' through ' . $period['end_label'] . '. '
+        . $skipped . ' probable duplicate(s) were skipped. '
+        . 'No real inbox delivery is configured.';
+
+    flash($inserted > 0 ? 'success' : 'warning', $message);
     redirect_to(['page' => 'emails']);
 }
 
@@ -5573,31 +5580,34 @@ function render_reports_page(PDO $pdo, array $savedReports, string $reportSql, a
 <?php
 }
 
-function suggested_email_range(PDO $pdo): array
+function sunday_notice_period(): array
 {
     $today = new DateTimeImmutable('today');
-    $start = $today->modify('next monday');
-    $end = $start->modify('+6 days');
+    $weekday = (int)$today->format('N'); // Monday = 1, Sunday = 7.
 
-    if (table_exists($pdo, 'Session')) {
-        $next = $pdo->query('SELECT MIN(SessionDateTime) FROM ' . qi('Session') . ' WHERE SessionDateTime >= NOW()')->fetchColumn();
-        if ($next === false || $next === null) {
-            $next = $pdo->query('SELECT MIN(SessionDateTime) FROM ' . qi('Session'))->fetchColumn();
-        }
-        if ($next !== false && $next !== null) {
-            $start = new DateTimeImmutable(substr((string)$next, 0, 10));
-            $end = $start->modify('+6 days');
-        }
+    if ($weekday === 7) {
+        // On Sunday, the coming week starts the next day.
+        $start = $today->modify('+1 day');
+    } else {
+        // On other days, rerun the period selected by the most recent Sunday.
+        $start = $today->modify('-' . ($weekday - 1) . ' days');
     }
 
-    return [$start->format('Y-m-d'), $end->format('Y-m-d')];
+    $end = $start->modify('+6 days');
+
+    return [
+        'start' => $start->format('Y-m-d'),
+        'end' => $end->format('Y-m-d'),
+        'start_label' => $start->format('l, F j, Y'),
+        'end_label' => $end->format('l, F j, Y'),
+    ];
 }
 
 function render_emails_page(PDO $pdo): void
 {
     page_heading(
-        'Email Generation and Logs',
-	''
+        'Upcoming Session Notices',
+        ''
     );
     foreach (['EmailLog', 'FormationAssignment', 'TeamFormation', 'Session', 'Team', 'Location', 'Personnel', 'ClubMember'] as $table) {
         if (!table_exists($pdo, $table)) {
@@ -5606,7 +5616,7 @@ function render_emails_page(PDO $pdo): void
         }
     }
 
-    [$start, $end] = suggested_email_range($pdo);
+    $period = sunday_notice_period();
     $preview = $_SESSION['generated_email_preview'] ?? [];
     unset($_SESSION['generated_email_preview']);
 
@@ -5624,32 +5634,50 @@ function render_emails_page(PDO $pdo): void
     ?>
 <div class="grid grid-2">
 <section class="card">
-    <h2>Generate session notices</h2>
+    <h2>Generate coming-week notices</h2>
+    <p>
+        This button manually runs the Sunday notice routine. It generates one notice for each
+        assigned player with a future game or training session in the active weekly period.
+    </p>
+    <p>
+        <strong>Notice period:</strong><br>
+        <?= e($period['start_label']) ?> through <?= e($period['end_label']) ?>
+    </p>
+    <p class="muted small">
+        Past sessions and sessions outside this Monday-through-Sunday period are excluded automatically.
+    </p>
     <form method="post">
-        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="generate_emails"><input type="hidden" name="return_page" value="emails">
-        <div class="form-grid">
-            <div class="field"><label>Start date *</label><input type="date" name="start_date" value="<?= e($start) ?>" required></div>
-            <div class="field"><label>End date *</label><input type="date" name="end_date" value="<?= e($end) ?>" required></div>
-            <div class="field full"><label><input style="width:auto;min-height:auto" type="checkbox" name="skip_duplicates" value="1" checked> Skip a row when duplicate email already exist</label></div>
+        <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="action" value="generate_emails">
+        <input type="hidden" name="return_page" value="emails">
+        <div class="field">
+            <label>
+                <input style="width:auto;min-height:auto" type="checkbox" name="skip_duplicates" value="1" checked>
+                Skip notices that have already been generated
+            </label>
         </div>
-        <button style="margin-top:14px" type="submit">Generate and log emails</button>
+        <button style="margin-top:14px" type="submit">Generate coming-week notices</button>
     </form>
 </section>
 <section class="card">
-    <h2>Body contents generated</h2>
+    <h2>Notice contents generated</h2>
     <ul>
         <li>Club member’s first name, last name, and formation role</li>
         <li>Head coach’s first name, last name, and email address</li>
         <li>Whether the session is training or a game</li>
         <li>Session date, time, address, and team name in the subject/body</li>
     </ul>
+    <p class="muted small">
+        The complete notice is previewed in the GUI, and the required log information is stored in EmailLog.
+        Real inbox delivery is not configured.
+    </p>
     <a class="button secondary" href="<?= e(build_url(['page' => 'table', 'table' => 'EmailLog'])) ?>">Raw EmailLog editor</a>
 </section>
 </div>
 
 <?php if (is_array($preview) && $preview !== []): ?>
 <section class="card">
-    <h2>Generated email preview</h2>
+    <h2>Generated notice preview</h2>
     <?php foreach ($preview as $email): ?>
         <details>
             <summary><?= e($email['subject']) ?></summary>

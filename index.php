@@ -4303,7 +4303,7 @@ function render_dashboard(PDO $pdo, array $dbConfig): void
 {
     page_heading(
         'Dashboard',
-        'Quick access to the required CRUD workflows, formation assignments, payments, reports, conflict trigger, and generated-email logs.'
+        ''
     );
 
     $metricTables = [

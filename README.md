@@ -4,7 +4,7 @@ A database-driven web application. The system is designed to manage the operatio
 
 ## Contributions
 
-**Micah — SQL Implementation & Data Population**
+**Micah Carreau — SQL Implementation & Data Population**
 
 - Designed, created, and modified the database tables required for the system.
 - Implemented database constraints, including:

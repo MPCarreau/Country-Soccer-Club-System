@@ -2,26 +2,26 @@
 
 A database-driven web application. The system is designed to manage the operations of a multi-location soccer club, including club members, family members, personnel, teams, training sessions, games, payments, and player participation.
 
-
 ## Contributions
 
-Micah — SQL Implementation & Data Population
+**Micah — SQL Implementation & Data Population**
 
-Designed, created, and modified the database tables required for the system.
-Implemented database constraints, including:
-Primary keys (PK)
-Foreign keys (FK)
-UNIQUE constraints
-CHECK constraints
-Created the SQL INSERT statements and populated the database with sufficient representative data to support the required queries.
-Implemented SQL operations to create, delete, edit, and display:
-Locations
-Personnel
-Family members (Primary/Secondary)
-Club members (Major/Minor)
-Team formations
-Implemented SQL operations for assigning, editing, and removing club members from team formations.
-Implemented SQL statements for recording club member payments.
+- Designed, created, and modified the database tables required for the system.
+- Implemented database constraints, including:
+  - Primary keys (PK)
+  - Foreign keys (FK)
+  - UNIQUE constraints
+  - CHECK constraints
+- Created all SQL `INSERT` statements.
+- Populated the database with sufficient representative data to support the required queries.
+- Implemented SQL operations to create, delete, edit, and display:
+  - Locations
+  - Personnel
+  - Family members (Primary/Secondary)
+  - Club members (Major/Minor)
+  - Team formations
+- Implemented SQL operations for assigning, editing, and removing club members from team formations.
+- Implemented SQL statements for recording club member payments.
 
 ## Overview
 
